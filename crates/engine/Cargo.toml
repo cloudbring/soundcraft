@@ -24,6 +24,7 @@ thiserror.workspace = true
 log.workspace = true
 zip.workspace = true
 craft-docpath.workspace = true
+craft-atomic.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

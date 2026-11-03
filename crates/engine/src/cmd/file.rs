@@ -48,7 +48,7 @@ pub fn specs() -> Vec<CommandSpec> {
             if cfg!(target_arch = "wasm32") {
                 crate::io::write_file(&file.to_string_lossy(), text.as_bytes())?;
             } else {
-                crate::io::replace_file(&file.with_extension("scraft.tmp"), &file, text.as_bytes())?;
+                crate::io::replace_file(&file, text.as_bytes())?;
             }
             Ok(json!({"path": file}))
         }),

@@ -553,21 +553,18 @@ fn write_session(session: &Session, path: &str, overwrite: bool) -> Result<(Sess
     }
     let text = s.to_json().map_err(|err| EngineError::Io(err.to_string()))?;
     make_dir(&dir)?;
-    // Atomic-ish write: temp file then rename.
-    let tmp = p.with_extension("scraft.tmp");
     if !overwrite && read_file(&p).is_ok_and(|old| old != text.as_bytes()) {
         back_up(&p);
     }
-    replace_file(&tmp, &p, text.as_bytes())?;
+    replace_file(&p, text.as_bytes())?;
     Ok((s, written, p))
 }
 
-/// Write `bytes` to `tmp`, flush it to disk and rename it over `file`, so `file` holds either the
-/// old or the new contents, never a mix.
-pub fn replace_file(tmp: &Path, file: &Path, bytes: &[u8]) -> Result<()> {
+/// Atomically replace a session file with `bytes`.
+pub fn replace_file(file: &Path, bytes: &[u8]) -> Result<()> {
     crate::file_access::check_write(file).map_err(EngineError::Io)?;
-    crate::file_access::check_write(tmp).map_err(EngineError::Io)?;
-    replace_with(tmp, file, write_synced(tmp, bytes))
+    crate::file_access::check_write(file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))).map_err(EngineError::Io)?;
+    craft_atomic::atomic_write(file, bytes).map_err(|err| EngineError::Io(format!("{}: {err}", file.display())))
 }
 
 /// Renames `tmp` over `file` once it is `written`, or removes it when writing or renaming failed.
@@ -584,13 +581,6 @@ fn replace_with(tmp: &Path, file: &Path, written: std::io::Result<()>) -> Result
 fn sync_dir(dir: &Path) {
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
     let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
 }
 
 /// Copies `from` to `to`, which must not exist yet; an existing entry, even a link, is never followed.

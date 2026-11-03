@@ -50,6 +50,7 @@ zip = { version = "9", default-features = false }
 cpal = "0.18"
 
 # Which file paths stored in a session may be opened.
+craft-atomic = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 
 # Video containers and bitstreams, shared with the other craft apps.

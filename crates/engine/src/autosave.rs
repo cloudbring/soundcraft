@@ -432,11 +432,14 @@ fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    write_synced(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        io_error(path, err)
-    })
+    write_atomically_with(&craft_atomic::RealFs, path, bytes)
+}
+
+fn write_atomically_with(fs: &dyn craft_atomic::AtomicFs, path: &Path, bytes: &[u8]) -> Result<()> {
+    craft_atomic::WriteOptions::default()
+        .with_new_file_permissions(craft_atomic::NewFilePermissions::Private)
+        .atomic_write_custom(fs, craft_atomic::RenameRetry::platform(), path, bytes)
+        .map_err(|err| io_error(path, err))
 }
 
 fn io_error(path: &Path, err: std::io::Error) -> EngineError {
@@ -450,6 +453,80 @@ mod tests {
     use serde_json::json;
     use soundcraft_audio_io::AudioBuffer;
     use soundcraft_model::{ChannelFormat, Clip, TrackKind};
+
+    struct FaultFs(&'static str);
+
+    impl craft_atomic::AtomicFs for FaultFs {
+        fn create_new(&self, path: &Path, permissions: craft_atomic::NewFilePermissions) -> std::io::Result<std::fs::File> {
+            if self.0 == "create" {
+                return Err(std::io::Error::other("injected create failure"));
+            }
+            craft_atomic::AtomicFs::create_new(&craft_atomic::RealFs, path, permissions)
+        }
+        fn sync(&self, file: &std::fs::File) -> std::io::Result<()> {
+            if self.0 == "sync" {
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            craft_atomic::AtomicFs::sync(&craft_atomic::RealFs, file)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.0 == "rename" {
+                return Err(std::io::Error::other("injected rename failure"));
+            }
+            craft_atomic::AtomicFs::rename(&craft_atomic::RealFs, from, to)
+        }
+        fn hard_link(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            craft_atomic::AtomicFs::hard_link(&craft_atomic::RealFs, from, to)
+        }
+        fn remove(&self, path: &Path) -> std::io::Result<()> {
+            craft_atomic::AtomicFs::remove(&craft_atomic::RealFs, path)
+        }
+        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            if self.0 == "directory" {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            craft_atomic::AtomicFs::sync_dir(&craft_atomic::RealFs, dir)
+        }
+        fn set_permissions(&self, file: &std::fs::File, permissions: std::fs::Permissions) -> std::io::Result<()> {
+            craft_atomic::AtomicFs::set_permissions(&craft_atomic::RealFs, file, permissions)
+        }
+    }
+
+    #[test]
+    fn atomic_autosave_faults_leave_old_or_new() {
+        let dir = folder("autosave-faults");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION);
+        for stage in ["create", "sync", "rename", "directory"] {
+            std::fs::write(&path, b"old").unwrap();
+            let result = write_atomically_with(&FaultFs(stage), &path, b"new");
+            let expected = if stage == "directory" { b"new" } else { b"old" };
+            assert_eq!(std::fs::read(&path).unwrap(), expected, "{stage}");
+            assert_eq!(result.is_ok(), stage == "directory", "{stage}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_atomic_autosaves_are_complete() {
+        let dir = folder("autosave-concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION);
+        let payloads: Vec<Vec<u8>> = (0..8).map(|byte| vec![byte; 16384]).collect();
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        write_atomically(path, payload).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(payloads.contains(&std::fs::read(&path).unwrap()));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn folder(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("soundcraft-{name}-{}", std::process::id()));

@@ -103,7 +103,6 @@ const MAX_UI_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Write settings atomically. Preserve an unreadable or malformed existing file for recovery.
 pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Result<(), String> {
-    use std::io::Write as _;
     // Loading can recover a future layout for this session, but saving must preserve its source.
     read_ui(path, false)?;
     docking::validate(&ui.docking)?;
@@ -119,19 +118,10 @@ pub fn save_ui(path: &std::path::Path, ui: &soundcraft_ui_egui::UiState) -> Resu
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|error| error.to_string())?.as_nanos();
-    let temporary = path.with_extension(format!("json.{}.{nonce}.tmp", std::process::id()));
-    let mut file =
-        std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|error| format!("Settings could not be saved: {error}"))?;
-    let written = (|| -> std::io::Result<()> {
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    written.map_err(|error| format!("Settings could not be saved: {error}"))
+    craft_atomic::WriteOptions::default()
+        .with_new_file_permissions(craft_atomic::NewFilePermissions::Private)
+        .atomic_write(path, &bytes)
+        .map_err(|error| format!("Settings could not be saved: {error}"))
 }
 
 #[cfg(test)]
