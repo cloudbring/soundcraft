@@ -3,6 +3,7 @@
 use crate::convert::{Matrix, Planes, planar_to_rgba, scale_rgba};
 use crate::isobmff::{self, ByteSource, CodecConfig, Mp4File, TrackKind};
 use crate::{Result, VideoError};
+use craft_h264::{Decoder, Picture};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -90,13 +91,13 @@ enum Codec {
 }
 
 struct H264State {
-    dec: crate::h264::Decoder,
+    dec: Decoder,
     /// Next sample (decode order) to feed.
     next: usize,
     /// Last presentation index output, if any.
     last_out: Option<usize>,
     /// Output pictures not requested yet (presentation index → picture).
-    ready: std::collections::BTreeMap<usize, crate::h264::Picture>,
+    ready: std::collections::BTreeMap<usize, Picture>,
 }
 
 /// A tiny LRU of decoded frames.
@@ -427,7 +428,7 @@ impl Movie {
         }
     }
 
-    fn h264_to_frame(&self, p: &crate::h264::Picture, index: usize) -> Frame {
+    fn h264_to_frame(&self, p: &Picture, index: usize) -> Frame {
         let m = Matrix::for_code(p.color.matrix, p.height, p.color.full_range);
         let rgba = planar_to_rgba(
             &Planes {
@@ -448,7 +449,7 @@ impl Movie {
 
     /// Decode one sample with a fresh decoder (keyframe thumbnails).
     fn decode_h264_single(&mut self, avcc: &[u8], sample: usize, index: usize) -> Result<Frame> {
-        let mut dec = crate::h264::Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
+        let mut dec = Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
         let data = self.read(sample)?;
         let mut pics = dec.decode(&data, index as i64).map_err(|e| VideoError::Decode(e.to_string()))?;
         pics.extend(dec.flush());
@@ -466,7 +467,7 @@ impl Movie {
             .as_ref()
             .is_some_and(|st| st.ready.contains_key(&index) || (key < st.next && st.next != usize::MAX && st.last_out.is_none_or(|lo| lo < index)));
         if !resume {
-            let dec = crate::h264::Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
+            let dec = Decoder::from_avcc(avcc).map_err(|e| VideoError::Decode(e.to_string()))?;
             self.h264 = Some(H264State { dec, next: key, last_out: None, ready: std::collections::BTreeMap::new() });
         }
         let total = self.order.len();

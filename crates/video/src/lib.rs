@@ -7,31 +7,30 @@
 //!   with a small LRU of decoded frames (sequential playback keeps decoding forward).
 //! - [`Movie::thumbnail_at`] / [`Movie::thumbnails`]: low-resolution timeline pictures (keyframes).
 //! - Unsupported codecs open fine (so the timeline can show the clip) but frame requests return
-//!   [`VideoError::Unsupported`]. Malformed files return errors; nothing here panics.
+//!   [`VideoError::Unsupported`]. Container and codec errors map to [`VideoError`].
 //!
 //! Picture codecs: H.264 / AVC (Baseline, Main, High; progressive 8-bit 4:2:0; CAVLC and CABAC),
 //! Apple ProRes (422 Proxy/LT/Standard/HQ, 4444/XQ) and Motion JPEG (`jpeg`/`mjpa`).
 //!
 //! ## Origin
 //!
-//! [`bitstream`] and [`isobmff`] are re-exports of `craft_media::bitstream` and
-//! `craft_media::isobmff` from craft-libs (`storytold/craft-libs`, the shared crate FilmCraft uses
-//! too). The H.264 and ProRes code is a copy of the clean-room crates of our sibling app FilmCraft
-//! (`storytold/filmcraft`, same organisation, MIT OR Apache-2.0): `filmcraft-h264` → [`h264`]
-//! (without its test-only synthetic stream module), `filmcraft-prores` → [`prores`]. Only the
-//! module paths were changed; fixes found here should be offered back upstream. [`Movie`], the
-//! pixel conversion and the frame caches are SoundCraft's own.
+//! [`h264`], [`bitstream`] and [`isobmff`] re-export `craft_h264`, `craft_bitstream` and
+//! `craft_media::isobmff` from craft-libs. The remaining ProRes code copies the clean-room
+//! `filmcraft-prores` crate of our sibling app FilmCraft (MIT OR Apache-2.0); fixes belong upstream.
+//! [`Movie`], pixel conversion and frame caches are SoundCraft's own. See `MIGRATION-48.md` in
+//! this crate for H.264 fork divergences and malformed-input hardening still needed upstream.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 // Codec code indexes fixed-size blocks; index loops read more clearly than iterator chains there.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 pub mod convert;
-pub mod h264;
 mod movie;
 pub mod prores;
 pub mod synth;
 
-pub use craft_media::{bitstream, isobmff};
+pub use craft_bitstream as bitstream;
+pub use craft_h264 as h264;
+pub use craft_media::isobmff;
 
 pub use isobmff::ByteSource;
 pub use movie::{Frame, Movie, MovieInfo, SharedSource, fit_size};
