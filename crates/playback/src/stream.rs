@@ -1,5 +1,8 @@
 use super::callback::{AudioState, Fault, guarded_block};
-use super::{Arc, AudioConfig, Cmd, Ordering, Plugin, Receiver, Sender, Shared, devices, mark_audio_thread};
+use super::{
+    Arc, AtomicBool, AudioConfig, ClipLookup, Cmd, MeterSnapshot, Ordering, Plugin, Session, Shared, SpscConsumer, SpscProducer, StallDetector,
+    TripleEdit, devices, mark_audio_thread,
+};
 
 /// Start a freshly built output stream. `false` when the device refuses to start it, so the caller
 /// treats it like a stream that failed to build and tries the next configuration.
@@ -16,8 +19,14 @@ pub(crate) fn start_stream(stream: &impl cpal::traits::StreamTrait) -> bool {
 /// A built output stream and the channels and fault flag its callback shares with the player.
 pub(crate) struct Opened {
     pub(crate) stream: cpal::Stream,
-    pub(crate) tx: Sender<Cmd>,
-    pub(crate) grx: Receiver<Vec<Box<dyn Plugin>>>,
+    pub(crate) tx: SpscProducer<Cmd>,
+    pub(crate) grx: SpscConsumer<Vec<Box<dyn Plugin>>>,
+    pub(crate) orx: SpscConsumer<Arc<Session>>,
+    pub(crate) mrx: SpscConsumer<MeterSnapshot>,
+    pub(crate) recycle_tx: SpscProducer<MeterSnapshot>,
+    pub(crate) watch: StallDetector,
+    pub(crate) index: TripleEdit<ClipLookup>,
+    pub(crate) session_adopted: Arc<AtomicBool>,
     pub(crate) fault: Arc<Fault>,
 }
 

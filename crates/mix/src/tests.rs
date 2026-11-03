@@ -7,6 +7,122 @@ use soundcraft_audio_io::AudioBuffer;
 use soundcraft_model::{Insert, SourceAudio, SourceId};
 use std::sync::Arc;
 
+#[test]
+#[ignore = "run with --release -- --ignored --nocapture to measure 1,000 blocks"]
+fn many_clips_render_benchmark() {
+    let mut session = Session::default();
+    let source = SourceId(1_000_000);
+    session.pool.insert(source, Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.25; 128]] })));
+    for _ in 0..64 {
+        let track = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        for clip_number in 0..500 {
+            let id = session.new_clip_id();
+            session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "bench", source, 0, clip_number * 1024, 128));
+        }
+    }
+    let mut engine = MixEngine::new(48_000.0, 512);
+    let mut output = vec![vec![0.0; 512]; 2];
+    engine.render(&session, 0, 512, &mut output);
+    let started = std::time::Instant::now();
+    let allocations = allocation_counter::measure(|| {
+        for block in 0..1000 {
+            engine.render(&session, block * 512, 512, &mut output);
+        }
+    });
+    println!("64 tracks × 500 clips × 1000 blocks: {:.2} ms; {} allocations", started.elapsed().as_secs_f64() * 1000.0, allocations.count_total);
+}
+
+#[test]
+fn clip_index_matches_scan_across_random_playback_and_seeks() {
+    let mut seed = 0x3141_5926_5358_9793_u64;
+    let mut random = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for _ in 0..64 {
+        let mut session = Session::default();
+        let source = SourceId(1_000_000);
+        session.pool.insert(
+            source,
+            Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![(0..512).map(|i| (i as f32 * 0.1).sin()).collect()] })),
+        );
+        let track = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+        let mut start = 0_i64;
+        for _ in 0..100 {
+            start += (random() % 65) as i64;
+            let length = (random() % 128 + 1) as i64;
+            let id = session.new_clip_id();
+            let mut clip = Clip::audio(id, "random", source, 0, start, length);
+            clip.muted = random() % 4 == 0;
+            session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(clip);
+        }
+        let clips = session.track(track).unwrap().clips();
+        let mut index = strip::ClipIndex::default();
+        index.rebuild(clips);
+        let mut position = 0;
+        for block in 0..160 {
+            if block % 7 == 0 {
+                position = (random() % 9000) as i64 - 500;
+            }
+            let frames = (random() % 129 + 1) as usize;
+            let range = Range::new(position, position + frames as i64);
+            let expected: Vec<_> = clips.iter().filter(|clip| clip.range().overlaps(&range)).collect();
+            let selected: Vec<_> = index.overlapping(clips, range).collect();
+            assert_eq!(selected, expected, "block {block} at {position}");
+            let mut old_audio = vec![vec![0.0; frames]];
+            let mut new_audio = old_audio.clone();
+            let mut scratch = vec![0.0; frames];
+            for clip in expected.into_iter().filter(|clip| !clip.muted && clip.is_audio()) {
+                clips::render_clip(&session, clip, position, frames, &mut old_audio, &mut scratch);
+            }
+            for clip in selected.into_iter().filter(|clip| !clip.muted && clip.is_audio()) {
+                clips::render_clip(&session, clip, position, frames, &mut new_audio, &mut scratch);
+            }
+            assert_eq!(new_audio, old_audio, "audio differs at block {block}");
+            position += frames as i64;
+        }
+    }
+}
+
+#[test]
+fn clip_index_rebuilds_when_session_snapshot_changes() {
+    let mut session = Session::default();
+    let source = SourceId(1_000_000);
+    session.pool.insert(source, Arc::new(SourceAudio::new(AudioBuffer { sample_rate: 48_000, channels: vec![vec![0.5; 32]] })));
+    let track = session.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
+    let id = session.new_clip_id();
+    session.track_mut(track).unwrap().playlist_mut().unwrap().clips.push(Clip::audio(id, "old", source, 0, 0, 32));
+    let mut engine = MixEngine::new(48_000.0, 64);
+    let mut output = vec![vec![0.0; 64]; 2];
+    engine.render(&session, 0, 64, &mut output);
+    assert!(output[0].iter().any(|&sample| sample != 0.0));
+
+    let mut edited = session.clone();
+    edited.track_mut(track).unwrap().playlist_mut().unwrap().clips[0].start = 128;
+    engine.render(&edited, 0, 64, &mut output);
+    assert!(output[0].iter().all(|&sample| sample == 0.0));
+    engine.render(&edited, 128, 64, &mut output);
+    assert!(output[0].iter().any(|&sample| sample != 0.0));
+}
+
+#[test]
+fn indexed_clip_selection_allocates_nothing_after_preparation() {
+    let clips: Vec<_> = (0..500)
+        .map(|clip_number| Clip::audio(soundcraft_model::ClipId(clip_number + 1), "clip", SourceId(1), 0, clip_number as i64 * 1024, 128))
+        .collect();
+    let mut index = strip::ClipIndex::default();
+    index.rebuild(&clips);
+    let allocations = allocation_counter::measure(|| {
+        for block in 0..1000 {
+            let start = block * 512;
+            std::hint::black_box(index.overlapping(&clips, Range::new(start, start + 512)).count());
+        }
+    });
+    assert_eq!(allocations.count_total, 0, "{allocations:?}");
+}
+
 fn synth_session(level_db: f32) -> Session {
     use soundcraft_midi::{Note, Sequence};
     let mut s = Session::default();

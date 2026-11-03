@@ -81,6 +81,32 @@ pub use offline::{
 pub use pan::itu_stereo_fold;
 use pan::{PanSpec, apply_matrix, apply_matrix_span, build_matrix};
 use routing::{processing_order, structure_fingerprint};
+
+/// Prefix-max clip ends, prepared with the session on the edit thread.
+#[derive(Default)]
+pub struct ClipLookup {
+    session: usize,
+    tracks: HashMap<TrackId, strip::ClipIndex>,
+}
+
+impl ClipLookup {
+    pub fn build(session: &Session) -> Self {
+        let tracks = session
+            .tracks
+            .iter()
+            .map(|track| {
+                let mut index = strip::ClipIndex::default();
+                index.rebuild(track.clips());
+                (track.id, index)
+            })
+            .collect();
+        Self { session: std::ptr::from_ref(session) as usize, tracks }
+    }
+
+    pub fn matches(&self, session: &Session) -> bool {
+        self.session == std::ptr::from_ref(session) as usize
+    }
+}
 use strip::{
     Block, BusBuf, LiveInput, SlotCtx, Strip, apply_params, contain_failure, note_insert_latency, process_strip, strip_channels, strip_format,
 };
@@ -120,6 +146,8 @@ pub struct MixEngine {
     last_end: Samples,
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
+    /// Session snapshots change identity when edited by the host.
+    indexed_session: usize,
     order: Vec<usize>,
     /// Current total compensation delay (samples) of the main mix: the slowest track and aux
     /// returns, and the master faders' inserts.
@@ -167,6 +195,7 @@ impl MixEngine {
             pan_law: PanLaw::Minus3,
             last_end: 0,
             synced: (0, 0, 0),
+            indexed_session: 0,
             order: Vec::new(),
             latency: 0,
             track_latency: 0,
@@ -265,6 +294,10 @@ impl MixEngine {
     /// Bring plugin instances in line with the session (creates/destroys as needed). Allocates;
     /// call outside the realtime thread when the document changes, or let `render` do it.
     pub fn sync(&mut self, s: &Session) {
+        self.sync_with(s, None);
+    }
+
+    fn sync_with(&mut self, s: &Session, prepared: Option<&ClipLookup>) {
         let mb = self.max_block;
         let main_ch = main_channels(s);
         self.main_fmt = s.main_format();
@@ -285,6 +318,9 @@ impl MixEngine {
         for t in &s.tracks {
             let ch = strip_channels(t, main_ch);
             let strip = self.strips.entry(t.id).or_insert_with(Strip::new);
+            if prepared.is_none() {
+                strip.clip_index.rebuild(t.clips());
+            }
             if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
                 strip.buf = vec![vec![0.0; mb]; ch];
             }
@@ -344,18 +380,34 @@ impl MixEngine {
     /// since the last sync (or instances were adopted). `render` calls it; a realtime host may
     /// also call it right after swapping sessions so slots are filled before playback starts.
     pub fn ensure_synced(&mut self, s: &Session) {
+        self.ensure_synced_with(s, None);
+    }
+
+    pub fn ensure_synced_with(&mut self, s: &Session, prepared: Option<&ClipLookup>) {
         let key = (structure_fingerprint(s), s.tracks.len(), s.busses.len());
         if key != self.synced {
-            self.sync(s);
+            self.sync_with(s, prepared);
             self.order = processing_order(s);
             self.synced = key;
+            self.indexed_session = std::ptr::from_ref(s) as usize;
+        } else if prepared.is_none() && self.indexed_session != std::ptr::from_ref(s) as usize {
+            for track in &s.tracks {
+                if let Some(strip) = self.strips.get_mut(&track.id) {
+                    strip.clip_index.rebuild(track.clips());
+                }
+            }
+            self.indexed_session = std::ptr::from_ref(s) as usize;
         }
     }
 
     /// Render `frames` (≤ max_block) samples starting at `pos` into `out` (≥ 2 channels).
     pub fn render(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>]) {
+        self.render_with_index(s, pos, frames, out, None);
+    }
+
+    pub fn render_with_index(&mut self, s: &Session, pos: Samples, frames: usize, out: &mut [Vec<f32>], prepared: Option<&ClipLookup>) {
         let frames = frames.min(self.max_block);
-        self.begin_block(s, pos, frames);
+        self.begin_block(s, pos, frames, prepared);
         let blk = Block { pos, frames, any_solo: s.tracks.iter().any(|t| t.mixer.solo && !t.inactive) };
         let order = std::mem::take(&mut self.order);
         // Phase 1: independent strips (audio, instrument, MIDI) in parallel.
@@ -376,7 +428,7 @@ impl MixEngine {
         let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
         run_strips(&mut work, |(i, st)| {
             if let Some(t) = s.tracks.get(*i) {
-                process_strip(s, t, st, &busses, &live_in, blk);
+                process_strip(s, t, st, &busses, &live_in, blk, prepared.and_then(|lookup| lookup.tracks.get(&t.id)));
             }
         });
         self.busses = busses;
@@ -385,14 +437,14 @@ impl MixEngine {
         // or the first block (and a one-block bounce probe) still sees zero.
         self.compensate_delay(s, &mut work, blk);
         self.work = work;
-        self.render_auxes(s, &order, blk);
+        self.render_auxes(s, &order, blk, prepared);
         self.order = order;
         self.render_masters(s, blk);
         self.write_output(s, blk, out);
     }
 
     /// Silence what a seek leaves ringing, sync to the session and clear the block's accumulators.
-    fn begin_block(&mut self, s: &Session, pos: Samples, frames: usize) {
+    fn begin_block(&mut self, s: &Session, pos: Samples, frames: usize, prepared: Option<&ClipLookup>) {
         if pos != self.last_end {
             // Seek: silence held notes and ringing plugins.
             for st in self.strips.values_mut() {
@@ -404,7 +456,7 @@ impl MixEngine {
             }
         }
         self.last_end = pos.saturating_add(frames as i64);
-        self.ensure_synced(s);
+        self.ensure_synced_with(s, prepared);
         for b in self.busses.values_mut() {
             for c in b.buf.iter_mut() {
                 c.iter_mut().take(frames).for_each(|x| *x = 0.0);
@@ -484,7 +536,7 @@ impl MixEngine {
     }
 
     /// Phase 2: auxes in dependency order (they read busses).
-    fn render_auxes(&mut self, s: &Session, order: &[usize], blk: Block) {
+    fn render_auxes(&mut self, s: &Session, order: &[usize], blk: Block, prepared: Option<&ClipLookup>) {
         let Block { pos, frames, .. } = blk;
         let pdc = s.edit.delay_compensation;
         let lmax_a = self.aux_latency;
@@ -494,7 +546,7 @@ impl MixEngine {
                 st.scratch.resize(self.max_block, 0.0);
             }
             let live_in = LiveInput { input: &self.input, monitor_only: self.monitor_only, recording: self.recording };
-            process_strip(s, t, &mut st, &self.busses, &live_in, blk);
+            process_strip(s, t, &mut st, &self.busses, &live_in, blk, prepared.and_then(|lookup| lookup.tracks.get(&t.id)));
             let ch = st.buf.len();
             st.align.set(if pdc { lmax_a.saturating_sub(st.latency) } else { 0 }, ch);
             st.align.process(&mut st.buf, frames);

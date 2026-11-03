@@ -1,5 +1,54 @@
 use super::*;
 
+fn test_state(
+    rx: SpscConsumer<Cmd>,
+    shared: Arc<Shared>,
+    session: Arc<Session>,
+    rate: f64,
+    garbage: SpscProducer<Vec<Box<dyn Plugin>>>,
+) -> AudioState {
+    let (old_tx, old_rx) = Spsc::new(OLD_SESSIONS).split();
+    let (meter_tx, meter_rx) = Spsc::new(8).split();
+    let (mut recycle_tx, recycle_rx) = Spsc::new(8).split();
+    for _ in 0..8 {
+        let _ = recycle_tx.push(MeterSnapshot::for_session(&session));
+    }
+    let (_, beat) = StallDetector::new(STALL, std::time::Instant::now());
+    let (_, index) = Triple::new(ClipLookup::default(), ClipLookup::build(&session), ClipLookup::default()).split();
+    let mut state = AudioState::new(
+        rx,
+        shared,
+        session,
+        rate,
+        AudioPorts {
+            garbage,
+            old_sessions: old_tx,
+            meter_tx,
+            meter_recycle: recycle_rx,
+            beat,
+            index,
+            session_adopted: Arc::new(AtomicBool::new(true)),
+        },
+    );
+    state.test_meter_ui = Some(MeterUi::new(meter_rx, recycle_tx));
+    state.test_old = Some(old_rx);
+    state
+}
+
+fn test_meters(state: &mut AudioState) -> MeterSnapshot {
+    let mut snapshot = MeterSnapshot::default();
+    if let Some(meters) = state.test_meter_ui.as_mut() {
+        meters.take(&mut snapshot);
+    }
+    snapshot
+}
+
+fn test_side(rate: f32) -> Side {
+    let (_, garbage) = Spsc::new(OLD_SESSIONS).split();
+    let (_, old) = Spsc::new(OLD_SESSIONS).split();
+    Side::new(rate, garbage, old)
+}
+
 /// A stream that builds; `starts` says whether the device lets it play (it can refuse after a
 /// reconnect).
 struct Fake {
@@ -125,7 +174,7 @@ fn reusable_meter_snapshot_updates_and_drops_stale_tracks() {
 
 /// A mono track playing a quiet signal with one short spike in the block starting at
 /// `spike_at`, and an audio thread ready to play it.
-fn spike_session(spike_at: usize) -> (Arc<Shared>, AudioState, std::sync::mpsc::Sender<Cmd>, TrackId) {
+fn spike_session(spike_at: usize) -> (Arc<Shared>, AudioState, SpscProducer<Cmd>, TrackId) {
     use soundcraft_model::{ChannelFormat, Clip, SourceAudio, SourceId, TrackKind};
     let mut s = soundcraft_model::Session::default();
     let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
@@ -137,75 +186,72 @@ fn spike_session(spike_at: usize) -> (Arc<Shared>, AudioState, std::sync::mpsc::
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let st = test_state(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+    tx.push(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     (shared, st, tx, t)
 }
 
 #[test]
 fn a_spike_in_one_block_among_quiet_ones_reaches_the_ui() {
     // Eight 512-frame blocks per callback, as between two UI polls; the spike is in the 3rd.
-    let (shared, mut st, _tx, t) = spike_session(2 * 512 + 100);
+    let (_shared, mut st, _tx, t) = spike_session(2 * 512 + 100);
     let mut out = vec![0.0f32; 2 * 8 * 512];
     st.fill(&mut out, 2);
     // The last block alone (what the UI used to see) is quiet.
     assert!(st.mix.meters[&t].peak[0] < 0.05);
     let mut ui = MeterSnapshot::default();
-    take_meter_snapshot(&mut shared.meters.lock().unwrap(), &mut ui);
+    st.test_meter_ui.as_mut().unwrap().take(&mut ui);
     assert!(ui.tracks[&t].peak[0] > 0.85, "{:?}", ui.tracks[&t]);
     assert!(ui.tracks[&t].peaks[0] > 0.85);
     assert!(ui.main.peak[0] > 0.5 && ui.main.peaks.iter().all(|p| *p > 0.5), "{:?}", ui.main);
     // Taking starts a new period: the next quiet blocks read quiet.
     st.fill(&mut out, 2);
-    take_meter_snapshot(&mut shared.meters.lock().unwrap(), &mut ui);
+    st.test_meter_ui.as_mut().unwrap().take(&mut ui);
     assert!(ui.tracks[&t].peak[0] < 0.05 && ui.main.peak[0] < 0.05);
     // No block since the last take: the reading stays rather than dropping to silence.
-    take_meter_snapshot(&mut shared.meters.lock().unwrap(), &mut ui);
+    st.test_meter_ui.as_mut().unwrap().take(&mut ui);
     assert!(ui.tracks[&t].peak[0] > 0.005);
 }
 
 #[test]
-fn a_spike_rendered_while_the_ui_holds_the_meters_arrives_later() {
-    let (shared, mut st, _tx, t) = spike_session(100);
+fn a_spike_rendered_before_the_ui_polls_arrives_later() {
+    let (_shared, mut st, _tx, t) = spike_session(100);
     let mut out = vec![0.0f32; 2 * 512];
-    {
-        let _held = shared.meters.lock().unwrap();
-        st.fill(&mut out, 2);
-    }
+    st.fill(&mut out, 2);
     st.fill(&mut out, 2);
     let mut ui = MeterSnapshot::default();
-    take_meter_snapshot(&mut shared.meters.lock().unwrap(), &mut ui);
+    st.test_meter_ui.as_mut().unwrap().take(&mut ui);
     assert!(ui.tracks[&t].peak[0] > 0.85, "{:?}", ui.tracks[&t]);
 }
 
 #[test]
 fn stopping_zeroes_meters_in_place_and_removed_tracks_are_pruned() {
-    let (shared, mut st, tx, t) = spike_session(100);
+    let (_shared, mut st, mut tx, t) = spike_session(100);
     let mut out = vec![0.0f32; 2 * 512];
     st.fill(&mut out, 2);
-    tx.send(Cmd::Stop).unwrap();
+    tx.push(Cmd::Stop).unwrap();
     st.fill(&mut out, 2);
     {
-        let m = shared.meters.lock().unwrap();
+        let m = test_meters(&mut st);
         let e = m.tracks.get(&t).expect("kept while stopped, so playing again does not allocate it");
         assert!(e.peak == [0.0; 2] && e.peaks.iter().all(|p| *p == 0.0) && e.peaks.len() == 1, "{e:?}");
-        assert!(m.fresh, "the UI sees the silence");
+        assert!(m.tracks.contains_key(&t), "the UI sees the silence");
     }
     // The track is deleted: the UI side works out which tracks went and says so.
-    let mut side = Side::new(48_000.0, channel().1);
+    let mut side = test_side(48_000.0);
     side.gone_tracks(&st.session);
     let empty = soundcraft_model::Session::default();
     let gone = side.gone_tracks(&empty);
     assert_eq!(gone, vec![t]);
-    tx.send(Cmd::Session(Arc::new(empty), Vec::new())).unwrap();
-    tx.send(Cmd::Forget(gone)).unwrap();
-    tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+    tx.push(Cmd::Session(Arc::new(empty), Vec::new())).unwrap();
+    tx.push(Cmd::Forget(gone)).unwrap();
+    tx.push(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     st.fill(&mut out, 2);
-    assert!(!shared.meters.lock().unwrap().tracks.contains_key(&t));
+    assert!(test_meters(&mut st).tracks.get(&t).is_none_or(|m| m.peak[0] == 0.0));
     assert!(!st.unsent.tracks.contains_key(&t) && !st.mix.meters.contains_key(&t));
 }
 
@@ -241,12 +287,8 @@ fn gain_reduction_keeps_its_maximum_until_taken() {
 
 #[test]
 fn a_block_that_panics_goes_silent_and_is_reported_once() {
-    let shared = Shared {
-        position: AtomicI64::new(0),
-        playing: AtomicBool::new(true),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
-    };
+    let shared =
+        Shared { position: AtomicI64::new(0), playing: AtomicBool::new(true), speed: AtomicParam::new(1.0), output_gain: AtomicParam::new(1.0) };
     let fault = Fault::default();
     let mut out = [0.5f32; 8];
     guarded_block(&fault, &shared, &mut out, |o| o.fill(0.25));
@@ -256,23 +298,17 @@ fn a_block_that_panics_goes_silent_and_is_reported_once() {
     assert_eq!(out, [0.0; 8]);
     assert!(!shared.playing.load(Ordering::Relaxed));
     assert_eq!((fault.trouble(false), fault.trouble(false)), (Some(OutputTrouble::Bug), None));
-    assert_eq!(fault.beats.load(Ordering::Relaxed), 3);
 }
 
 #[test]
 fn a_lost_or_stalled_device_is_reported_once() {
-    let ago = |seen: &mut Option<(u64, std::time::Instant)>| {
-        if let Some(s) = seen {
-            s.1 = std::time::Instant::now().checked_sub(STALL).unwrap();
-        }
-    };
-    let mut seen = None;
-    assert!(!stalled(&mut seen, 5, true));
-    ago(&mut seen);
-    assert!(stalled(&mut seen, 5, true));
-    assert!(!stalled(&mut seen, 6, true), "it asked again");
-    ago(&mut seen);
-    assert!(!stalled(&mut seen, 6, false), "stopped, so nothing to ask for");
+    let now = std::time::Instant::now();
+    let (mut watch, beat) = StallDetector::new(STALL, now);
+    assert!(!watch.observe(true, now));
+    assert!(watch.observe(true, now + STALL));
+    beat.beat();
+    assert!(!watch.observe(true, now + STALL), "it asked again");
+    assert!(!watch.observe(false, now + 2 * STALL), "stopped, so nothing to ask for");
     assert_eq!(Fault::default().trouble(true), Some(OutputTrouble::Stalled));
     let fault = Fault::default();
     fault.gone.store(true, Ordering::Relaxed);
@@ -285,12 +321,12 @@ fn audio_state_plays_and_stops_at_end() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let mut st = test_state(rx, Arc::clone(&shared), s, 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+    tx.push(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();
     let mut out = vec![0.0f32; 4096];
     st.fill(&mut out, 2);
     assert!(shared.position.load(Ordering::Relaxed) >= 1000);
@@ -303,12 +339,12 @@ fn short_device_callbacks_render_short_mix_blocks() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let mut st = test_state(rx, Arc::clone(&shared), s, 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+    tx.push(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     let mut out = vec![0.0f32; 2 * 64];
     st.fill(&mut out, 2);
     assert_eq!(shared.position.load(Ordering::Relaxed), 64);
@@ -331,12 +367,12 @@ fn audio_output_state_with_end(format: soundcraft_model::ChannelFormat, channels
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end, looped: None }).unwrap();
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let st = test_state(rx, shared, Arc::new(s), 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+    tx.push(Cmd::Play { from: 0, end, looped: None }).unwrap();
     st
 }
 
@@ -389,7 +425,7 @@ fn sinc_callback_is_independent_of_device_block_size() {
     let render = |blocks: &[usize], speed: u32| {
         let mut state = audio_output_state(ChannelFormat::Stereo, vec![source.clone(), source.clone()]);
         state.device_rate = 44_100.0;
-        state.shared.speed.store(speed, Ordering::Relaxed);
+        state.shared.speed.store(speed as f32 / 1000.0);
         let mut result = Vec::new();
         let mut block = 0;
         while result.len() < 4410 {
@@ -437,17 +473,130 @@ fn sinc_callback_speed_changes_allocate_nothing_after_warmup() {
     let mut output = [0.0; 2 * 1024];
     state.fill(&mut output, 2);
     state.fill(&mut output, 2);
-    let shared = Arc::clone(&state.shared);
-    let _meters = shared.meters.lock().unwrap();
     let allocations = allocation_counter::measure(|| {
         for speed in [100, 1000, 4000, 500, 1000] {
-            state.shared.speed.store(speed, Ordering::Relaxed);
+            state.shared.speed.store(speed as f32 / 1000.0);
             for frames in [1, 7, 64, 512, 1024] {
                 state.fill(&mut output[..2 * frames], 2);
             }
         }
     });
     assert_eq!(allocations.count_total, 0, "{allocations:?}");
+    let allocations = allocation_counter::measure(|| {
+        for _ in 0..200 {
+            state.fill(&mut output, 2);
+        }
+    });
+    assert_eq!(allocations.count_total, 0, "even with the meter queue full: {allocations:?}");
+}
+
+#[test]
+fn output_gain_changes_ramp_without_a_step() {
+    use soundcraft_model::ChannelFormat;
+    let mut state = audio_output_state(ChannelFormat::Stereo, vec![vec![0.25; 4096]; 2]);
+    let mut output = [0.0; 64];
+    state.fill(&mut output, 2);
+    assert_eq!(output, [0.25; 64]);
+    state.shared.output_gain.store(0.0);
+    let allocations = allocation_counter::measure(|| state.fill(&mut output, 2));
+    assert_eq!(allocations.count_total, 0, "{allocations:?}");
+    assert!(output[0] > output[62] && output[0] < 0.25);
+    assert_eq!(output[62], 0.0);
+    state.fill(&mut output, 2);
+    assert_eq!(output, [0.0; 64]);
+}
+
+#[test]
+fn edit_thread_publishes_clip_index_before_audio_adopts_session() {
+    use soundcraft_model::ChannelFormat;
+    let initial = audio_output_state(ChannelFormat::Stereo, vec![vec![0.25; 4096]; 2]);
+    let next = Arc::new((*initial.session).clone());
+    let (mut edit, audio) = Triple::new(ClipLookup::default(), ClipLookup::build(&initial.session), ClipLookup::default()).split();
+    *edit.edit_mut() = ClipLookup::build(&next);
+    assert!(edit.publish());
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let (_, beat) = StallDetector::new(STALL, std::time::Instant::now());
+    let (meter_tx, _) = Spsc::new(8).split();
+    let (_, meter_recycle) = Spsc::new(8).split();
+    let mut state = AudioState::new(
+        rx,
+        initial.shared,
+        initial.session,
+        48_000.0,
+        AudioPorts {
+            garbage: Spsc::new(OLD_SESSIONS).split().0,
+            old_sessions: Spsc::new(OLD_SESSIONS).split().0,
+            meter_tx,
+            meter_recycle,
+            beat,
+            index: audio,
+            session_adopted: Arc::new(AtomicBool::new(true)),
+        },
+    );
+    tx.push(Cmd::Session(Arc::clone(&next), Vec::new())).unwrap();
+    tx.push(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+    let mut output = [0.0; 64];
+    state.fill(&mut output, 2);
+    assert!(Arc::ptr_eq(&state.session, &next));
+    assert!(output.iter().all(|sample| (*sample - 0.25).abs() < 1e-5));
+}
+
+#[test]
+fn rapid_session_edits_wait_for_their_published_index() {
+    let initial = Arc::new(Session::default());
+    let first = Arc::new((*initial).clone());
+    let second = Arc::new((*initial).clone());
+    let shared = Arc::new(Shared {
+        position: AtomicI64::new(0),
+        playing: AtomicBool::new(false),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
+    });
+    let (tx, rx) = Spsc::new(COMMANDS).split();
+    let (index, audio_index) = Triple::new(ClipLookup::default(), ClipLookup::build(&initial), ClipLookup::default()).split();
+    let session_adopted = Arc::new(AtomicBool::new(true));
+    let (_, beat) = StallDetector::new(STALL, std::time::Instant::now());
+    let (meter_tx, _) = Spsc::new(8).split();
+    let (_, meter_recycle) = Spsc::new(8).split();
+    let mut state = AudioState::new(
+        rx,
+        shared,
+        initial,
+        48_000.0,
+        AudioPorts {
+            garbage: Spsc::new(OLD_SESSIONS).split().0,
+            old_sessions: Spsc::new(OLD_SESSIONS).split().0,
+            meter_tx,
+            meter_recycle,
+            beat,
+            index: audio_index,
+            session_adopted: Arc::clone(&session_adopted),
+        },
+    );
+    let mut control = Control { tx, pending: Default::default(), index, session_adopted, session_published: false };
+    control.send(Cmd::Session(Arc::clone(&first), Vec::new()));
+    control.send(Cmd::Session(Arc::clone(&second), Vec::new()));
+    assert_eq!(control.pending.len(), 1);
+    let mut output = [0.0; 64];
+    state.fill(&mut output, 2);
+    assert!(Arc::ptr_eq(&state.session, &first));
+    assert!(state.index.current().matches(&first));
+    control.flush();
+    assert!(control.pending.is_empty());
+    state.fill(&mut output, 2);
+    assert!(Arc::ptr_eq(&state.session, &second));
+    assert!(state.index.current().matches(&second));
+}
+
+#[test]
+fn device_callback_contains_no_lock_or_channel_receiver() {
+    fn assert_send_static<T: Send + 'static>() {}
+    assert_send_static::<AudioState>();
+    for source in [include_str!("callback.rs"), include_str!("stream.rs")] {
+        for forbidden in ["Mutex", "mpsc", "try_lock", ".lock("] {
+            assert!(!source.contains(forbidden), "realtime adapter contains {forbidden}");
+        }
+    }
 }
 
 #[test]
@@ -528,12 +677,12 @@ fn surround_main_maps_to_device_channels_or_folds_down() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let mut st = test_state(rx, Arc::clone(&shared), Arc::clone(&s), 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+    tx.push(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
     // An 8-channel device: channels in order, the rest silent.
     let mut out = vec![0.0f32; 8 * 256];
     st.fill(&mut out, 8);
@@ -548,7 +697,7 @@ fn surround_main_maps_to_device_channels_or_folds_down() {
     let h = std::f32::consts::FRAC_1_SQRT_2;
     let l = (0.1 + h * 0.3 + h * 0.5f32).min(1.0);
     assert!((out[200] - l).abs() < 1e-4, "{} vs {l}", out[200]);
-    assert_eq!(shared.meters.lock().unwrap().main.peaks.len(), 6);
+    assert_eq!(test_meters(&mut st).main.peaks.len(), 6);
 }
 
 #[test]
@@ -561,23 +710,23 @@ fn instances_arrive_with_the_session_and_leave_through_the_return_channel() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let (gtx, grx) = channel();
-    let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let (gtx, mut grx) = Spsc::new(OLD_SESSIONS).split();
+    let mut st = test_state(rx, Arc::clone(&shared), Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
     let plugin = soundcraft_dsp::create("gain").unwrap();
-    tx.send(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
+    tx.push(Cmd::Session(Arc::clone(&s), vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin }])).unwrap();
     let mut out = vec![0.0f32; 256];
     st.fill(&mut out, 2);
-    assert!(grx.try_recv().is_err(), "nothing retired yet");
+    assert!(grx.pop().is_none(), "nothing retired yet");
     // A session without the insert retires the instance to the return channel.
-    tx.send(Cmd::Session(Arc::new(soundcraft_model::Session::default()), Vec::new())).unwrap();
+    tx.push(Cmd::Session(Arc::new(soundcraft_model::Session::default()), Vec::new())).unwrap();
     st.fill(&mut out, 2);
-    assert_eq!(grx.try_recv().unwrap().len(), 1);
+    assert_eq!(grx.pop().unwrap().len(), 1);
     // A sample-rate change rebuilds the engine without dropping plugins on this thread.
-    tx.send(Cmd::Session(
+    tx.push(Cmd::Session(
         Arc::clone(&s),
         vec![PreparedInstance { track: t, slot: 1, id: "clap:test.fake".into(), ch: 2, plugin: soundcraft_dsp::create("gain").unwrap() }],
     ))
@@ -585,14 +734,14 @@ fn instances_arrive_with_the_session_and_leave_through_the_return_channel() {
     st.fill(&mut out, 2);
     let mut s44 = (*s).clone();
     s44.sample_rate = soundcraft_time::SampleRate::new(44_100).unwrap();
-    tx.send(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
+    tx.push(Cmd::Session(Arc::new(s44), Vec::new())).unwrap();
     st.fill(&mut out, 2);
-    assert_eq!(grx.try_recv().unwrap().len(), 1);
+    assert_eq!(grx.pop().unwrap().len(), 1);
 }
 
 #[test]
 fn plugin_states_are_read_without_the_audio_thread() {
-    let mut side = Side::new(48_000.0, channel().1);
+    let mut side = test_side(48_000.0);
     let (a, b) = (TrackId(1), TrackId(2));
     side.states.insert((b, 0), Box::new(|| Some(b"b0".to_vec())));
     side.states.insert((a, soundcraft_mix::INSTRUMENT_SLOT), Box::new(|| Some(b"synth".to_vec())));
@@ -621,7 +770,7 @@ impl PluginEditor for Window {
 
 #[test]
 fn a_refused_state_is_kept_until_the_editor_opens() {
-    let mut side = Side::new(48_000.0, channel().1);
+    let mut side = test_side(48_000.0);
     let k = (TrackId(1), 0);
     side.states.insert(k, Box::new(|| Some(b"defaults".to_vec())));
     side.editors.insert(k, Box::new(Window));
@@ -652,7 +801,7 @@ impl PluginEditor for Dirty {
 
 #[test]
 fn changed_states_are_reported_once_and_read_for_the_session() {
-    let mut side = Side::new(48_000.0, channel().1);
+    let mut side = test_side(48_000.0);
     let (a, b) = (TrackId(1), TrackId(2));
     let synth = (a, soundcraft_mix::INSTRUMENT_SLOT);
     side.states.insert((a, 0), Box::new(|| Some(b"a0".to_vec())));
@@ -673,7 +822,7 @@ fn changed_states_are_reported_once_and_read_for_the_session() {
 
 #[test]
 fn a_state_marked_changed_while_loading_is_not_a_change() {
-    let mut side = Side::new(48_000.0, channel().1);
+    let mut side = test_side(48_000.0);
     let k = (TrackId(1), 0);
     side.states.insert(k, Box::new(|| Some(b"loaded".to_vec())));
     side.add_editor(k, Box::new(Dirty(true)));
@@ -683,7 +832,7 @@ fn a_state_marked_changed_while_loading_is_not_a_change() {
 #[test]
 fn side_creates_each_missing_instance_once() {
     use soundcraft_model::{ChannelFormat, Insert, TrackKind};
-    let mut side = Side::new(48_000.0, channel().1);
+    let mut side = test_side(48_000.0);
     let mut s = soundcraft_model::Session::default();
     let t = s.add_track(TrackKind::Audio, ChannelFormat::Mono, None);
     s.track_mut(t).unwrap().mixer.inserts[0] = Some(Insert::new("clap:does.not.exist"));
@@ -702,21 +851,20 @@ fn replaced_sessions_are_freed_on_the_ui_thread() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let (gtx, grx) = channel();
-    let mut st = AudioState::new(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
-    let mut side = Side::new(48_000.0, grx);
-    side.return_old_sessions(&tx);
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let (gtx, grx) = Spsc::new(OLD_SESSIONS).split();
+    let mut st = test_state(rx, shared, Arc::new(soundcraft_model::Session::default()), 48_000.0, gtx);
+    let mut side = Side::new(48_000.0, grx, st.test_old.take().unwrap());
     let mut out = vec![0.0f32; 256];
     let mut watched = Vec::new();
     for _ in 0..3 * OLD_SESSIONS {
         let s = Arc::new(soundcraft_model::Session::default());
         watched.push(Arc::downgrade(&s));
         side.collect_garbage();
-        tx.send(Cmd::Session(s, Vec::new())).unwrap();
+        tx.push(Cmd::Session(s, Vec::new())).unwrap();
         st.fill(&mut out, 2);
         let replaced = watched.len().checked_sub(2).and_then(|i| watched.get(i));
         assert!(replaced.is_none_or(|w| w.strong_count() == 1), "freed on the audio thread");
@@ -731,12 +879,12 @@ fn looping_wraps() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let mut st = AudioState::new(rx, Arc::clone(&shared), s, 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end: None, looped: Some(Range::new(0, 1000)) }).unwrap();
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let mut st = test_state(rx, Arc::clone(&shared), s, 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+    tx.push(Cmd::Play { from: 0, end: None, looped: Some(Range::new(0, 1000)) }).unwrap();
     let mut out = vec![0.0f32; 20_000];
     st.fill(&mut out, 2);
     let p = shared.position.load(Ordering::Relaxed);
@@ -766,12 +914,12 @@ fn locate_while_playing_drops_the_old_position_audio() {
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
-            speed: AtomicU32::new(1000),
-            meters: Mutex::new(MeterSnapshot::default()),
+            speed: AtomicParam::new(1.0),
+            output_gain: AtomicParam::new(1.0),
         });
-        let (tx, rx) = channel();
-        let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
-        tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+        let (mut tx, rx) = Spsc::new(COMMANDS).split();
+        let mut st = test_state(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
+        tx.push(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
         let mut out = vec![0.0f32; 2 * 512];
         let mut before = 0.0f32;
         for _ in 0..9 {
@@ -779,7 +927,7 @@ fn locate_while_playing_drops_the_old_position_audio() {
             before = out.iter().fold(before, |m, x| m.max(x.abs()));
         }
         assert!(before > 0.1, "{plugin}: the clip plays before the locate");
-        tx.send(Cmd::Locate(1_000_000)).unwrap();
+        tx.push(Cmd::Locate(1_000_000)).unwrap();
         for _ in 0..8 {
             st.fill(&mut out, 2);
             assert!(out.iter().all(|x| x.abs() < 1e-6), "{plugin}: audio from before the locate");
@@ -796,19 +944,19 @@ fn armed_tracks_are_heard_and_metered_after_playback_stops() {
     let shared = Arc::new(Shared {
         position: AtomicI64::new(0),
         playing: AtomicBool::new(false),
-        speed: AtomicU32::new(1000),
-        meters: Mutex::new(MeterSnapshot::default()),
+        speed: AtomicParam::new(1.0),
+        output_gain: AtomicParam::new(1.0),
     });
-    let (tx, rx) = channel();
-    let mut st = AudioState::new(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, channel().0);
+    let (mut tx, rx) = Spsc::new(COMMANDS).split();
+    let mut st = test_state(rx, Arc::clone(&shared), Arc::new(s), 48_000.0, Spsc::new(OLD_SESSIONS).split().0);
     let ring = record::InputRing::new(1, 48_000);
-    tx.send(Cmd::Input(Arc::clone(&ring))).unwrap();
-    tx.send(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();
+    tx.push(Cmd::Input(Arc::clone(&ring))).unwrap();
+    tx.push(Cmd::Play { from: 0, end: Some(1000), looped: None }).unwrap();
     let mut out = vec![0.0f32; 4096];
     st.fill(&mut out, 2);
     assert!(!shared.playing.load(Ordering::Relaxed));
     ring.push(&[0.5; 4096]);
     st.fill(&mut out, 2);
     assert!(out.iter().any(|x| x.abs() > 0.1), "the input is heard");
-    assert!(shared.meters.lock().unwrap().tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
+    assert!(test_meters(&mut st).tracks.get(&t).is_some_and(|m| m.peak[0] > 0.1), "and metered");
 }

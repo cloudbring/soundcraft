@@ -2,9 +2,8 @@
 //! PipeWire via ALSA, JACK, WebAudio).
 //!
 //! The UI thread owns a [`Player`]; the audio callback owns the [`MixEngine`] and a snapshot of
-//! the session (`Arc<Session>`) that the UI swaps whenever the document changes. Commands go to
-//! the callback through a channel; position and meters come back through atomics and a
-//! `try_lock`ed snapshot, so the callback never blocks. When no device is available the player
+//! the session (`Arc<Session>`) that the UI swaps whenever the document changes. Commands and
+//! meters travel through bounded SPSC queues; the callback never blocks. Without a device the player
 //! falls back to a silent clock thread so the transport, meters and automation still run.
 //!
 //! Surround: the device is opened with as many output channels as it offers, up to the width of
@@ -22,7 +21,7 @@
 //! state and prepared on the thread that calls [`Player::update_session`] (the UI thread), and
 //! travel to the audio thread together with the session snapshot that needs them; the mix
 //! engine adopts them (see `soundcraft_mix`'s crate docs). Instances the engine retires, and the
-//! session snapshots the callback replaces, come back on return channels and are dropped on the UI
+//! session snapshots the callback replaces, come back on return queues and are dropped on the UI
 //! thread ([`Player::idle`]). Plugin editors are driven, and plugin states for saving read
 //! ([`Player::capture_states`]), on the UI thread
 //! through handles taken from each instance before it leaves ([`Player::open_editor`]).
@@ -33,19 +32,20 @@ pub mod record;
 
 pub use devices::AudioConfig;
 
+use craft_audio_rt::{AtomicParam, Spsc, SpscConsumer, SpscProducer, StallDetector, Triple, TripleEdit};
 use soundcraft_dsp::{Plugin, PluginEditor, PluginStateReader};
-use soundcraft_mix::{MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
+use soundcraft_mix::{ClipLookup, MAX_CHANNELS, MixEngine, PreparedInstance, StripMeter, itu_stereo_fold, main_channels};
 use soundcraft_model::{Session, TrackId};
 use soundcraft_time::{Range, Samples};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 const BLOCK: usize = 512;
 
 /// Room for replaced snapshots on their way back; `update_session` empties it before each send.
-const OLD_SESSIONS: usize = 16;
+const OLD_SESSIONS: usize = 128;
+const COMMANDS: usize = 4096;
 
 /// The realtime audio thread marker lives in the mix engine, which carries it into the strips it
 /// renders on worker threads; the cpal callbacks here set it.
@@ -55,11 +55,11 @@ mod callback;
 mod resample;
 mod stream;
 
-use callback::{AudioState, Fault, Side, take_meter_snapshot};
-#[cfg(test)]
-use callback::{STALL, copy_meter_snapshot};
 #[cfg(not(target_arch = "wasm32"))]
-use callback::{guarded_block, stalled};
+use callback::guarded_block;
+use callback::{AudioPorts, AudioState, Fault, MeterUi, Side};
+#[cfg(test)]
+use callback::{STALL, copy_meter_snapshot, take_meter_snapshot};
 #[cfg(test)]
 use stream::pick_output_config;
 use stream::{Opened, build_output, first_started, open_device, start_stream};
@@ -74,6 +74,7 @@ pub struct MeterSnapshot {
     pub main: StripMeter,
     /// Something was written since the UI last took the values.
     fresh: bool,
+    clear_previous: bool,
 }
 
 impl MeterSnapshot {
@@ -96,6 +97,7 @@ impl MeterSnapshot {
         self.main.reset_levels();
         self.tracks.values_mut().for_each(StripMeter::reset_levels);
         self.fresh = false;
+        self.clear_previous = false;
     }
 
     /// Nothing is playing or monitored: every meter reads silence. Levels are zeroed in place,
@@ -103,6 +105,24 @@ impl MeterSnapshot {
     fn silence(&mut self) {
         self.reset_levels();
         self.fresh = true;
+        self.clear_previous = true;
+    }
+
+    fn for_session(session: &Session) -> Self {
+        let main = StripMeter { peaks: vec![0.0; main_channels(session)], ..StripMeter::default() };
+        let tracks = session
+            .tracks
+            .iter()
+            .map(|track| {
+                let channels = match track.kind {
+                    soundcraft_model::TrackKind::Master => main_channels(session),
+                    soundcraft_model::TrackKind::Instrument => track.channels().clamp(2, MAX_CHANNELS),
+                    _ => track.channels().clamp(1, MAX_CHANNELS),
+                };
+                (track.id, StripMeter { peaks: vec![0.0; channels], ..StripMeter::default() })
+            })
+            .collect();
+        Self { tracks, main, fresh: false, clear_previous: false }
     }
 
     /// Drop the entries of deleted tracks.
@@ -122,8 +142,6 @@ pub type EditorEdit = (TrackId, usize, String, f32);
 enum Cmd {
     /// A new snapshot plus the third-party instances it needs (created on the UI thread).
     Session(Arc<Session>, Vec<PreparedInstance>),
-    /// Where the callback sends the snapshots it replaces (freeing one takes thousands of frees).
-    OldSessions(SyncSender<Arc<Session>>),
     Input(Arc<record::InputRing>),
     Recording(bool),
     Play {
@@ -137,12 +155,60 @@ enum Cmd {
     Forget(Vec<TrackId>),
 }
 
+#[cfg(test)]
+impl std::fmt::Debug for Cmd {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("playback command")
+    }
+}
+
 struct Shared {
     position: AtomicI64,
     playing: AtomicBool,
-    /// Speed × 1000.
-    speed: AtomicU32,
-    meters: Mutex<MeterSnapshot>,
+    speed: AtomicParam,
+    output_gain: AtomicParam,
+}
+
+struct Control {
+    tx: SpscProducer<Cmd>,
+    pending: std::collections::VecDeque<Cmd>,
+    index: TripleEdit<ClipLookup>,
+    session_adopted: Arc<AtomicBool>,
+    session_published: bool,
+}
+
+impl Control {
+    fn send(&mut self, cmd: Cmd) {
+        self.pending.push_back(cmd);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        while let Some(cmd) = self.pending.front() {
+            if self.tx.slots() == 0 {
+                break;
+            }
+            if let Cmd::Session(session, _) = cmd
+                && !self.session_published
+            {
+                if !self.session_adopted.load(Ordering::Acquire) || self.tx.slots() == 0 {
+                    break;
+                }
+                *self.index.edit_mut() = ClipLookup::build(session);
+                if !self.index.publish() {
+                    break;
+                }
+                self.session_adopted.store(false, Ordering::Release);
+                self.session_published = true;
+            }
+            let Some(cmd) = self.pending.pop_front() else { break };
+            if let Err(cmd) = self.tx.push(cmd) {
+                self.pending.push_front(cmd);
+                break;
+            }
+            self.session_published = false;
+        }
+    }
 }
 
 /// What stopped the audio output.
@@ -160,11 +226,14 @@ pub enum OutputTrouble {
 pub struct Player {
     shared: Arc<Shared>,
     fault: Arc<Fault>,
-    /// The block count last seen while playing, and since when.
+    /// Observed on the UI thread; the callback only increments the heartbeat.
     #[cfg(not(target_arch = "wasm32"))]
-    watch: Mutex<Option<(u64, std::time::Instant)>>,
-    tx: Sender<Cmd>,
+    watch: Mutex<StallDetector>,
+    stall_count: std::sync::atomic::AtomicU64,
+    stalled_reported: AtomicBool,
+    tx: Mutex<Control>,
     side: Mutex<Side>,
+    meters: Mutex<MeterUi>,
     #[cfg(not(target_arch = "wasm32"))]
     _stream: Option<cpal::Stream>,
     #[cfg(target_arch = "wasm32")]
@@ -189,7 +258,6 @@ impl Player {
     /// defaults for whatever is unavailable. Never fails: without a device it runs a silent clock.
     pub fn with_config(session: Arc<Session>, cfg: &AudioConfig) -> Player {
         let p = Player::open(Arc::clone(&session), cfg);
-        p.side().return_old_sessions(&p.tx);
         // Hand the initial session's third-party plugins over.
         p.update_session(session);
         p
@@ -201,11 +269,30 @@ impl Player {
         #[cfg(not(target_arch = "wasm32"))]
         let stalled = {
             let playing = self.shared.playing.load(Ordering::Relaxed) && !self.silent;
-            stalled(&mut self.watch.lock().unwrap_or_else(PoisonError::into_inner), self.fault.beats.load(Ordering::Relaxed), playing)
+            self.watch.lock().unwrap_or_else(PoisonError::into_inner).observe(playing, std::time::Instant::now())
         };
         #[cfg(target_arch = "wasm32")]
         let stalled = false;
+        if stalled {
+            if !self.stalled_reported.swap(true, Ordering::Relaxed) {
+                self.stall_count.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            self.stalled_reported.store(false, Ordering::Relaxed);
+        }
         self.fault.trouble(stalled)
+    }
+
+    pub fn stall_count(&self) -> u64 {
+        self.stall_count.load(Ordering::Relaxed)
+    }
+
+    fn send(&self, cmd: Cmd) {
+        #[cfg(target_arch = "wasm32")]
+        if self.silent {
+            return;
+        }
+        self.tx.lock().unwrap_or_else(PoisonError::into_inner).send(cmd);
     }
 
     fn side(&self) -> std::sync::MutexGuard<'_, Side> {
@@ -219,14 +306,14 @@ impl Player {
         let shared = Arc::new(Shared {
             position: AtomicI64::new(0),
             playing: AtomicBool::new(false),
-            speed: AtomicU32::new(1000),
-            meters: Mutex::new(MeterSnapshot::default()),
+            speed: AtomicParam::new(1.0),
+            output_gain: AtomicParam::new(1.0),
         });
         let want = session.sample_rate.hz();
         let want_ch = u16::try_from(main_channels(&session)).unwrap_or(2);
         let side_rate = session.sample_rate.as_f64() as f32;
-        let new_side = |garbage: Receiver<Vec<Box<dyn Plugin>>>| {
-            let mut side = Side::new(side_rate, garbage);
+        let new_side = |garbage: SpscConsumer<Vec<Box<dyn Plugin>>>, old: SpscConsumer<Arc<Session>>| {
+            let mut side = Side::new(side_rate, garbage, old);
             side.gone_tracks(&session);
             Mutex::new(side)
         };
@@ -242,21 +329,46 @@ impl Player {
                     |config: &cpal::StreamConfig| -> Result<Opened, cpal::Error> {
                         let rate = config.sample_rate;
                         let channels = usize::from(config.channels);
-                        let (tx, rx) = channel();
-                        let (gtx, grx) = channel();
-                        let state = AudioState::new(rx, Arc::clone(&shared), Arc::clone(&session), f64::from(rate), gtx);
+                        let (tx, rx) = Spsc::new(COMMANDS).split();
+                        let (gtx, grx) = Spsc::new(OLD_SESSIONS).split();
+                        let (otx, orx) = Spsc::new(OLD_SESSIONS).split();
+                        let (mtx, mrx) = Spsc::new(8).split();
+                        let (mut recycle_tx, recycle_rx) = Spsc::new(8).split();
+                        for _ in 0..8 {
+                            let _ = recycle_tx.push(MeterSnapshot::for_session(&session));
+                        }
+                        let (watch, beat) = StallDetector::new(callback::STALL, std::time::Instant::now());
+                        let (index, audio_index) = Triple::new(ClipLookup::default(), ClipLookup::build(&session), ClipLookup::default()).split();
+                        let session_adopted = Arc::new(AtomicBool::new(true));
+                        let state = AudioState::new(
+                            rx,
+                            Arc::clone(&shared),
+                            Arc::clone(&session),
+                            f64::from(rate),
+                            AudioPorts {
+                                garbage: gtx,
+                                old_sessions: otx,
+                                meter_tx: mtx,
+                                meter_recycle: recycle_rx,
+                                beat,
+                                index: audio_index,
+                                session_adopted: Arc::clone(&session_adopted),
+                            },
+                        );
                         let fault = Arc::new(Fault::default());
                         let stream = match format {
                             cpal::SampleFormat::I32 => build_output::<i32>(&device, *config, state, channels, &fault, &shared),
                             cpal::SampleFormat::I16 => build_output::<i16>(&device, *config, state, channels, &fault, &shared),
                             _ => build_output::<f32>(&device, *config, state, channels, &fault, &shared),
                         }?;
-                        Ok(Opened { stream, tx, grx, fault })
+                        Ok(Opened { stream, tx, grx, orx, mrx, recycle_tx, watch, index, session_adopted, fault })
                     },
                     |opened| start_stream(&opened.stream),
                 );
                 match opened {
-                    Some((config, Opened { stream, tx, grx, fault })) => {
+                    Some((config, Opened { stream, tx, grx, orx, mrx, recycle_tx, watch, index, session_adopted, fault })) => {
+                        #[cfg(target_arch = "wasm32")]
+                        let _ = &watch;
                         let rate = config.sample_rate;
                         let channels = usize::from(config.channels);
                         let buffer = match config.buffer_size {
@@ -271,9 +383,12 @@ impl Player {
                             shared,
                             fault,
                             #[cfg(not(target_arch = "wasm32"))]
-                            watch: Mutex::new(None),
-                            tx,
-                            side: new_side(grx),
+                            watch: Mutex::new(watch),
+                            stall_count: std::sync::atomic::AtomicU64::new(0),
+                            stalled_reported: AtomicBool::new(false),
+                            tx: Mutex::new(Control { tx, pending: Default::default(), index, session_adopted, session_published: false }),
+                            side: new_side(grx, orx),
+                            meters: Mutex::new(MeterUi::new(mrx, recycle_tx)),
                             _stream: Some(stream),
                             device_name: name,
                             device_rate: rate,
@@ -284,46 +399,64 @@ impl Player {
                     }
                     None => {
                         log::warn!("no usable audio stream; using a silent clock");
-                        let (tx, rx) = channel();
-                        let (gtx, grx) = channel();
-                        Player::silent_clock(shared, tx, rx, want, new_side(grx), gtx)
+                        Player::silent_clock(shared, want, new_side)
                     }
                 }
             }
             Err(e) => {
                 log::warn!("no audio output: {e}; using a silent clock");
-                let (tx, rx) = channel();
-                let (gtx, grx) = channel();
-                Player::silent_clock_with(shared, tx, rx, Arc::clone(&session), new_side(grx), gtx)
+                Player::silent_clock_with(shared, Arc::clone(&session), new_side)
             }
         }
     }
 
     fn silent_clock(
         shared: Arc<Shared>,
-        tx: Sender<Cmd>,
-        rx: Receiver<Cmd>,
         rate: u32,
-        side: Mutex<Side>,
-        gtx: Sender<Vec<Box<dyn Plugin>>>,
+        new_side: impl FnOnce(SpscConsumer<Vec<Box<dyn Plugin>>>, SpscConsumer<Arc<Session>>) -> Mutex<Side>,
     ) -> Player {
         let s = Arc::new(Session::new("Untitled", soundcraft_time::SampleRate::new(rate).unwrap_or_default()));
-        Player::silent_clock_with(shared, tx, rx, s, side, gtx)
+        Player::silent_clock_with(shared, s, new_side)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     fn silent_clock_with(
         shared: Arc<Shared>,
-        tx: Sender<Cmd>,
-        rx: Receiver<Cmd>,
         session: Arc<Session>,
-        side: Mutex<Side>,
-        gtx: Sender<Vec<Box<dyn Plugin>>>,
+        new_side: impl FnOnce(SpscConsumer<Vec<Box<dyn Plugin>>>, SpscConsumer<Arc<Session>>) -> Mutex<Side>,
     ) -> Player {
+        let (tx, rx) = Spsc::new(COMMANDS).split();
+        let (gtx, grx) = Spsc::new(OLD_SESSIONS).split();
+        let (otx, orx) = Spsc::new(OLD_SESSIONS).split();
+        let (mtx, mrx) = Spsc::new(8).split();
+        let (mut recycle_tx, recycle_rx) = Spsc::new(8).split();
+        for _ in 0..8 {
+            let _ = recycle_tx.push(MeterSnapshot::for_session(&session));
+        }
+        let (watch, beat) = StallDetector::new(callback::STALL, std::time::Instant::now());
+        let (index, audio_index) = Triple::new(ClipLookup::default(), ClipLookup::build(&session), ClipLookup::default()).split();
+        let session_adopted = Arc::new(AtomicBool::new(true));
+        let side = new_side(grx, orx);
         let rate = session.sample_rate.hz();
-        let mut state = AudioState::new(rx, Arc::clone(&shared), session, f64::from(rate), gtx);
+        let state = AudioState::new(
+            rx,
+            Arc::clone(&shared),
+            session,
+            f64::from(rate),
+            AudioPorts {
+                garbage: gtx,
+                old_sessions: otx,
+                meter_tx: mtx,
+                meter_recycle: recycle_rx,
+                beat,
+                index: audio_index,
+                session_adopted: Arc::clone(&session_adopted),
+            },
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut state = state;
         let fault = Arc::new(Fault::default());
         let failed = Arc::clone(&fault);
+        #[cfg(not(target_arch = "wasm32"))]
         let spawn = std::thread::Builder::new().name("soundcraft-clock".into()).spawn(move || {
             let mut buf = vec![0.0f32; 4096];
             let mut last = std::time::Instant::now();
@@ -342,41 +475,25 @@ impl Player {
                 }
             }
         });
+        #[cfg(not(target_arch = "wasm32"))]
         if let Err(e) = spawn {
             log::warn!("clock thread failed: {e}");
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (state, failed, watch);
         Player {
             shared,
             fault,
-            watch: Mutex::new(None),
-            tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            watch: Mutex::new(watch),
+            stall_count: std::sync::atomic::AtomicU64::new(0),
+            stalled_reported: AtomicBool::new(false),
+            tx: Mutex::new(Control { tx, pending: Default::default(), index, session_adopted, session_published: false }),
             side,
+            meters: Mutex::new(MeterUi::new(mrx, recycle_tx)),
             _stream: None,
             device_name: "No audio device (silent)".into(),
             device_rate: rate,
-            device_channels: 0,
-            device_buffer: None,
-            silent: true,
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn silent_clock_with(
-        shared: Arc<Shared>,
-        tx: Sender<Cmd>,
-        _rx: Receiver<Cmd>,
-        session: Arc<Session>,
-        side: Mutex<Side>,
-        _gtx: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Player {
-        Player {
-            shared,
-            fault: Arc::default(),
-            tx,
-            side,
-            _stream: None,
-            device_name: "No audio device".into(),
-            device_rate: session.sample_rate.hz(),
             device_channels: 0,
             device_buffer: None,
             silent: true,
@@ -390,9 +507,9 @@ impl Player {
             let mut side = self.side();
             (side.prepare(&s), side.gone_tracks(&s))
         };
-        let _ = self.tx.send(Cmd::Session(s, instances));
+        self.send(Cmd::Session(s, instances));
         if !gone.is_empty() {
-            let _ = self.tx.send(Cmd::Forget(gone));
+            self.send(Cmd::Forget(gone));
         }
     }
 
@@ -415,6 +532,7 @@ impl Player {
     /// Per-UI-frame housekeeping: drops retired instances and services plugin editors. Returns
     /// the parameter edits made in open editors since the last call.
     pub fn idle(&self) -> Vec<EditorEdit> {
+        self.tx.lock().unwrap_or_else(PoisonError::into_inner).flush();
         let mut side = self.side();
         side.collect_garbage();
         let mut out = Vec::new();
@@ -475,36 +593,44 @@ impl Player {
     pub fn play(&self, from: Samples, end: Option<Samples>, looped: Option<Range>) {
         self.shared.position.store(from, Ordering::Relaxed);
         self.shared.playing.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(Cmd::Play { from, end, looped });
+        self.send(Cmd::Play { from, end, looped });
     }
 
     /// Feed live input (from a `record::Recorder`) into the mix for input monitoring.
     pub fn set_input(&self, ring: Arc<record::InputRing>) {
-        let _ = self.tx.send(Cmd::Input(ring));
+        self.send(Cmd::Input(ring));
     }
 
     pub fn set_recording(&self, on: bool) {
-        let _ = self.tx.send(Cmd::Recording(on));
+        self.send(Cmd::Recording(on));
     }
 
     pub fn stop(&self) {
         self.shared.playing.store(false, Ordering::Relaxed);
-        let _ = self.tx.send(Cmd::Stop);
+        self.send(Cmd::Stop);
     }
 
     pub fn locate(&self, at: Samples) {
         self.shared.position.store(at, Ordering::Relaxed);
-        let _ = self.tx.send(Cmd::Locate(at));
+        self.send(Cmd::Locate(at));
     }
 
     pub fn set_speed(&self, speed: f32) {
         let v = if speed.is_finite() { (speed.clamp(0.1, 4.0) * 1000.0) as u32 } else { 1000 };
-        self.shared.speed.store(v, Ordering::Relaxed);
+        self.shared.speed.store(v as f32 / 1000.0);
     }
 
     /// Playback rate last requested, 1.0 at full speed.
     pub fn speed(&self) -> f32 {
-        self.shared.speed.load(Ordering::Relaxed) as f32 / 1000.0
+        self.shared.speed.load()
+    }
+
+    /// Set the final device gain, ramped across the next callback to avoid a step.
+    /// Track faders and automation remain part of the session snapshot and mix engine.
+    pub fn set_output_gain(&self, gain: f32) {
+        if gain.is_finite() {
+            self.shared.output_gain.store(gain.clamp(0.0, 4.0));
+        }
     }
 
     pub fn position(&self) -> Samples {
@@ -518,7 +644,9 @@ impl Player {
     /// A copy of the meters accumulated since the last [`Player::take_meters`], leaving them in
     /// place (for inspection; the UI takes them instead).
     pub fn meters(&self) -> MeterSnapshot {
-        self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        let mut snapshot = MeterSnapshot::default();
+        self.take_meters(&mut snapshot);
+        snapshot
     }
 
     /// Take the meters accumulated since the last call into reusable UI storage and start a new
@@ -526,11 +654,12 @@ impl Player {
     /// rendered since (a large device buffer renders several blocks per callback), `out` keeps
     /// the previous values rather than dropping to silence. Call it from one place only (two
     /// readers would split the peaks between them). Once track/channel counts are stable this
-    /// performs no allocation. The audio thread only ever `try_lock`s, so holding the lock here
-    /// never blocks it; blocks rendered meanwhile reach the next call.
+    /// performs no allocation. Holding the UI lock never blocks the audio thread; blocks rendered
+    /// meanwhile reach the next call through the bounded queue.
     pub fn take_meters(&self, out: &mut MeterSnapshot) {
-        let mut source = self.shared.meters.lock().unwrap_or_else(PoisonError::into_inner);
-        take_meter_snapshot(&mut source, out);
+        self.meters.lock().unwrap_or_else(PoisonError::into_inner).take(out);
+        let side = self.side();
+        out.tracks.retain(|id, _| side.tracks.contains(id));
     }
 }
 

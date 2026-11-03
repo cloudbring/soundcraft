@@ -1,18 +1,19 @@
 use super::{
-    Arc, AtomicBool, BLOCK, BTreeMap, Cmd, HashMap, HashSet, MAX_CHANNELS, MeterSnapshot, MixEngine, OLD_SESSIONS, Ordering, OutputTrouble, Plugin,
-    PluginEditor, PluginStateReader, PluginStates, PreparedInstance, Range, Receiver, Samples, Sender, Session, Shared, SyncSender, TrackId,
-    itu_stereo_fold, main_channels, record, sync_channel,
+    Arc, AtomicBool, BLOCK, BTreeMap, Cmd, HashMap, HashSet, MAX_CHANNELS, MeterSnapshot, MixEngine, Ordering, OutputTrouble, Plugin, PluginEditor,
+    PluginStateReader, PluginStates, PreparedInstance, Range, Samples, Session, Shared, SpscConsumer, SpscProducer, TrackId, itu_stereo_fold,
+    main_channels, record,
 };
+use craft_audio_rt::{AudioCallback, PanicGuard, StallBeat, TripleAudio};
+use soundcraft_mix::ClipLookup;
 
 /// How the audio output is doing, for the UI.
 #[derive(Default)]
 pub(crate) struct Fault {
     /// A block panicked: output stays silent from then on.
-    failed: AtomicBool,
+    guard: PanicGuard,
     /// The device went away or the stream was invalidated: only a reconnect can restore audio.
     pub(crate) gone: AtomicBool,
     /// Blocks so far, to tell a device that stopped asking for audio.
-    pub(crate) beats: std::sync::atomic::AtomicU64,
     /// The UI has been told.
     reported: AtomicBool,
 }
@@ -20,7 +21,7 @@ pub(crate) struct Fault {
 impl Fault {
     /// What stopped the output, once.
     pub(crate) fn trouble(&self, stalled: bool) -> Option<OutputTrouble> {
-        let trouble = if self.failed.load(Ordering::Relaxed) {
+        let trouble = if self.guard.failed() {
             OutputTrouble::Bug
         } else if self.gone.load(Ordering::Relaxed) {
             OutputTrouble::Gone
@@ -34,28 +35,21 @@ impl Fault {
 }
 
 /// How long a playing output may go without a block before it counts as stalled.
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const STALL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// True once the block count `beats` has stood still for `STALL` while playing; `seen` is the
-/// count last seen and since when.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn stalled(seen: &mut Option<(u64, std::time::Instant)>, beats: u64, playing: bool) -> bool {
-    match *seen {
-        Some((b, since)) if playing && b == beats => since.elapsed() >= STALL,
-        _ => {
-            *seen = Some((beats, std::time::Instant::now()));
-            false
-        }
-    }
-}
 
 /// Fill one block with `fill`. If it panics, the block and every later one are silent and the
 /// transport stops, rather than the panic taking the app down.
 pub(crate) fn guarded_block(fault: &Fault, shared: &Shared, out: &mut [f32], fill: impl FnOnce(&mut [f32])) {
-    fault.beats.fetch_add(1, Ordering::Relaxed);
-    if fault.failed.load(Ordering::Relaxed) || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fill(out))).is_err() {
-        fault.failed.store(true, Ordering::Relaxed);
+    struct Once<F>(Option<F>);
+    impl<F: FnOnce(&mut [f32])> AudioCallback for Once<F> {
+        fn render(&mut self, output: &mut [f32]) {
+            if let Some(fill) = self.0.take() {
+                fill(output);
+            }
+        }
+    }
+    let mut callback = Once(Some(fill));
+    if !fault.guard.render(&mut callback, out) {
         shared.playing.store(false, Ordering::Relaxed);
         out.fill(0.0);
     }
@@ -63,7 +57,7 @@ pub(crate) fn guarded_block(fault: &Fault, shared: &Shared, out: &mut [f32], fil
 
 /// State owned by the audio callback.
 pub(crate) struct AudioState {
-    rx: Receiver<Cmd>,
+    rx: SpscConsumer<Cmd>,
     pub(crate) shared: Arc<Shared>,
     pub(crate) session: Arc<Session>,
     pub(crate) mix: MixEngine,
@@ -84,13 +78,23 @@ pub(crate) struct AudioState {
     input: Option<Arc<record::InputRing>>,
     recording: bool,
     /// Retired plugin instances go back to the UI thread to be dropped there.
-    garbage: Sender<Vec<Box<dyn Plugin>>>,
-    old_sessions: Option<SyncSender<Arc<Session>>>,
-    /// Meters of blocks rendered while the UI held the shared snapshot (`try_lock` failed), so
-    /// their peaks reach it with the next block instead of being lost.
+    garbage: SpscProducer<Vec<Box<dyn Plugin>>>,
+    old_sessions: SpscProducer<Arc<Session>>,
+    deferred_sessions: Vec<Arc<Session>>,
+    deferred_plugins: Vec<Box<dyn Plugin>>,
+    meter_tx: SpscProducer<MeterSnapshot>,
+    meter_recycle: SpscConsumer<MeterSnapshot>,
+    beat: StallBeat,
+    pub(crate) index: TripleAudio<ClipLookup>,
+    session_adopted: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) test_meter_ui: Option<MeterUi>,
+    #[cfg(test)]
+    pub(crate) test_old: Option<SpscConsumer<Arc<Session>>>,
+    /// Meters awaiting a free slot in the UI queue; retain peaks until they can be published.
     pub(crate) unsent: MeterSnapshot,
-    /// Deleted tracks still to drop from the shared snapshot (it was locked when they went).
-    forget_shared: Vec<TrackId>,
+    forgotten: Vec<TrackId>,
+    output_gain: f32,
 }
 
 fn new_engine(sr: f32) -> MixEngine {
@@ -100,19 +104,36 @@ fn new_engine(sr: f32) -> MixEngine {
     m
 }
 
+/// Preallocated, single-owner endpoints handed to the callback when the device opens.
+pub(crate) struct AudioPorts {
+    pub(crate) garbage: SpscProducer<Vec<Box<dyn Plugin>>>,
+    pub(crate) old_sessions: SpscProducer<Arc<Session>>,
+    pub(crate) meter_tx: SpscProducer<MeterSnapshot>,
+    pub(crate) meter_recycle: SpscConsumer<MeterSnapshot>,
+    pub(crate) beat: StallBeat,
+    pub(crate) index: TripleAudio<ClipLookup>,
+    pub(crate) session_adopted: Arc<AtomicBool>,
+}
+
 impl AudioState {
-    pub(crate) fn new(
-        rx: Receiver<Cmd>,
-        shared: Arc<Shared>,
-        session: Arc<Session>,
-        device_rate: f64,
-        garbage: Sender<Vec<Box<dyn Plugin>>>,
-    ) -> Self {
+    pub(crate) fn new(rx: SpscConsumer<Cmd>, shared: Arc<Shared>, session: Arc<Session>, device_rate: f64, ports: AudioPorts) -> Self {
         let sr = session.sample_rate.as_f64() as f32;
         let nch = main_channels(&session);
+        let unsent = MeterSnapshot::for_session(&session);
         AudioState {
-            garbage,
-            old_sessions: None,
+            garbage: ports.garbage,
+            old_sessions: ports.old_sessions,
+            deferred_sessions: Vec::new(),
+            deferred_plugins: Vec::new(),
+            meter_tx: ports.meter_tx,
+            meter_recycle: ports.meter_recycle,
+            beat: ports.beat,
+            index: ports.index,
+            session_adopted: ports.session_adopted,
+            #[cfg(test)]
+            test_meter_ui: None,
+            #[cfg(test)]
+            test_old: None,
             fold: fold_gains(&session),
             rx,
             shared,
@@ -131,32 +152,29 @@ impl AudioState {
             device_rate,
             input: None,
             recording: false,
-            unsent: MeterSnapshot::default(),
-            forget_shared: Vec::new(),
+            unsent,
+            forgotten: Vec::new(),
+            output_gain: 1.0,
         }
     }
 
     fn drain(&mut self) {
         let mut changed = false;
-        while let Ok(c) = self.rx.try_recv() {
+        while let Some(c) = self.rx.pop() {
             match c {
                 Cmd::Input(r) => self.input = Some(r),
                 Cmd::Forget(gone) => {
                     self.unsent.forget(&gone);
-                    if self.forget_shared.is_empty() {
-                        self.forget_shared = gone;
-                    } else {
-                        self.forget_shared.extend_from_slice(&gone);
-                    }
-                    self.forget_meters();
+                    self.forgotten.extend(gone);
                 }
                 Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s, instances) => {
+                    self.index.poll();
                     changed = true;
                     let rate_changed = (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5;
                     if rate_changed {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
-                        let _ = self.garbage.send(old.drain_plugins());
+                        self.deferred_plugins.extend(old.drain_plugins());
                     }
                     self.mix.adopt(instances);
                     // The main format changed (a document edit, not steady state): resize.
@@ -174,11 +192,8 @@ impl AudioState {
                     }
                     self.fold = fold_gains(&s);
                     let old = std::mem::replace(&mut self.session, s);
-                    if let Some(tx) = &self.old_sessions {
-                        let _ = tx.try_send(old);
-                    }
+                    self.deferred_sessions.push(old);
                 }
-                Cmd::OldSessions(tx) => self.old_sessions = Some(tx),
                 Cmd::Play { from, end, looped } => {
                     self.pos = from;
                     self.end = end;
@@ -213,16 +228,36 @@ impl AudioState {
         if changed {
             // Place adopted instances now (not only once playback starts), so editors see them;
             // `sync` creates no third-party plugins here.
-            self.mix.ensure_synced(&self.session);
+            let lookup = self.index.current();
+            self.mix.ensure_synced_with(&self.session, lookup.matches(&self.session).then_some(lookup));
+            self.session_adopted.store(true, Ordering::Release);
         }
         self.send_garbage();
+        self.return_sessions();
         self.shared.playing.store(self.playing, Ordering::Relaxed);
     }
 
     fn send_garbage(&mut self) {
-        let g = self.mix.take_retired();
-        if !g.is_empty() {
-            let _ = self.garbage.send(g);
+        if self.deferred_plugins.is_empty() {
+            self.deferred_plugins = self.mix.take_retired();
+        } else {
+            self.deferred_plugins.extend(self.mix.take_retired());
+        }
+        if !self.deferred_plugins.is_empty()
+            && self.garbage.slots() != 0
+            && let Err(plugins) = self.garbage.push(std::mem::take(&mut self.deferred_plugins))
+        {
+            self.deferred_plugins = plugins;
+        }
+    }
+
+    fn return_sessions(&mut self) {
+        while !self.deferred_sessions.is_empty() && self.old_sessions.slots() != 0 {
+            let old = self.deferred_sessions.remove(0);
+            if let Err(old) = self.old_sessions.push(old) {
+                self.deferred_sessions.insert(0, old);
+                break;
+            }
         }
     }
 
@@ -268,7 +303,8 @@ impl AudioState {
         }
         self.mix.monitor_only = !self.playing;
         self.mix.recording = self.recording;
-        self.mix.render(&self.session, self.pos, n, &mut self.pending);
+        let lookup = self.index.current();
+        self.mix.render_with_index(&self.session, self.pos, n, &mut self.pending, lookup.matches(&self.session).then_some(lookup));
         self.send_garbage();
         self.pending_len = n;
         self.publish_meters();
@@ -278,48 +314,47 @@ impl AudioState {
         }
     }
 
-    /// Drop deleted tracks' meters from the shared snapshot, unless the UI holds it right now.
-    fn forget_meters(&mut self) {
-        if !self.forget_shared.is_empty()
-            && let Ok(mut m) = self.shared.meters.try_lock()
-        {
-            m.forget(&self.forget_shared);
-            self.forget_shared.clear();
-        }
-    }
-
-    /// Hand this block's meters to the UI without blocking: they are folded (max) into what the
-    /// UI has not taken yet. If the UI holds the snapshot right now, they wait in `unsent`.
+    /// Fold each rendered block into the unpublished snapshot, then hand it to the UI.
     fn publish_meters(&mut self) {
         self.unsent.accumulate(&self.mix.main_meter, &self.mix.meters);
-        self.forget_meters();
-        if let Ok(mut m) = self.shared.meters.try_lock() {
-            m.accumulate(&self.unsent.main, &self.unsent.tracks);
-            self.unsent.reset_levels();
+        self.flush_meters();
+    }
+
+    fn flush_meters(&mut self) {
+        if self.meter_tx.slots() != 0
+            && let Some(mut recycled) = self.meter_recycle.pop()
+        {
+            recycled.reset_levels();
+            recycled.forget(&self.forgotten);
+            let published = std::mem::replace(&mut self.unsent, recycled);
+            if let Err(published) = self.meter_tx.push(published) {
+                self.unsent = published;
+            }
         }
     }
 
     /// Fill an interleaved device buffer.
     pub(crate) fn fill(&mut self, out: &mut [f32], channels: usize) {
+        self.beat.beat();
         self.drain();
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
         if !self.playing && !monitoring && self.tail_remaining == 0 {
             out.iter_mut().for_each(|x| *x = 0.0);
             self.unsent.silence();
-            self.forget_meters();
-            if let Ok(mut m) = self.shared.meters.try_lock() {
-                m.silence();
-            }
+            self.flush_meters();
             return;
         }
-        let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
+        let speed = f64::from(self.shared.speed.load());
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
         let bypass = step == 1.0;
         self.resampler.set_step(step);
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
+        let target_gain = self.shared.output_gain.load();
+        let gain_step = (target_gain - self.output_gain) / callback_frames.max(1) as f32;
         for frame in out.chunks_mut(channels) {
+            self.output_gain += gain_step;
             while self.read >= self.pending_len as f64 {
                 self.consume(self.pending_len);
                 self.read -= self.pending_len as f64;
@@ -340,9 +375,11 @@ impl AudioState {
             let sample = |c: usize| {
                 if bypass { self.pending.get(c).and_then(|samples| samples.get(i0)).copied().unwrap_or(0.0) } else { self.resampler.sample(c, fr) }
             };
-            write_frame(frame, channels, nch, sounding, &self.fold, sample);
+            let gain = self.output_gain;
+            write_frame(frame, channels, nch, sounding, &self.fold, |channel| sample(channel) * gain);
             self.read += step;
         }
+        self.output_gain = target_gain;
     }
 
     fn consume(&mut self, end: usize) {
@@ -406,14 +443,14 @@ pub(crate) struct Side {
     /// Instances that refused their stored state: saves keep that state until the plugin's editor
     /// is opened.
     pub(crate) refused: HashSet<(TrackId, usize)>,
-    garbage: Receiver<Vec<Box<dyn Plugin>>>,
-    old_sessions: Option<Receiver<Arc<Session>>>,
+    garbage: SpscConsumer<Vec<Box<dyn Plugin>>>,
+    old_sessions: SpscConsumer<Arc<Session>>,
     /// The tracks of the session last sent, to tell the audio thread which ones went.
-    tracks: HashSet<TrackId>,
+    pub(crate) tracks: HashSet<TrackId>,
 }
 
 impl Side {
-    pub(crate) fn new(rate: f32, garbage: Receiver<Vec<Box<dyn Plugin>>>) -> Side {
+    pub(crate) fn new(rate: f32, garbage: SpscConsumer<Vec<Box<dyn Plugin>>>, old_sessions: SpscConsumer<Arc<Session>>) -> Side {
         Side {
             shadow: HashMap::new(),
             rate,
@@ -421,7 +458,7 @@ impl Side {
             states: BTreeMap::new(),
             refused: HashSet::new(),
             garbage,
-            old_sessions: None,
+            old_sessions,
             tracks: HashSet::new(),
         }
     }
@@ -437,21 +474,15 @@ impl Side {
     /// Drops retired instances (closing their editors first, inside the plugin's drop) and
     /// replaced session snapshots.
     pub(crate) fn collect_garbage(&mut self) {
-        while let Ok(g) = self.garbage.try_recv() {
+        while let Some(g) = self.garbage.pop() {
             for p in g {
                 log::debug!("plugin instance released: {}", p.info().name);
                 drop(p);
             }
         }
-        if let Some(rx) = &self.old_sessions {
-            rx.try_iter().for_each(drop);
+        while let Some(old) = self.old_sessions.pop() {
+            drop(old);
         }
-    }
-
-    pub(crate) fn return_old_sessions(&mut self, tx: &Sender<Cmd>) {
-        let (otx, orx) = sync_channel(OLD_SESSIONS);
-        self.old_sessions = Some(orx);
-        let _ = tx.send(Cmd::OldSessions(otx));
     }
 
     pub(crate) fn forget(&mut self, key: (TrackId, usize)) {
@@ -480,6 +511,35 @@ pub(crate) fn copy_meter_snapshot(source: &MeterSnapshot, out: &mut MeterSnapsho
         out.tracks.entry(*id).or_default().copy_from(meter);
     }
     out.main.copy_from(&source.main);
+}
+
+pub(crate) struct MeterUi {
+    rx: SpscConsumer<MeterSnapshot>,
+    recycle: SpscProducer<MeterSnapshot>,
+}
+
+impl MeterUi {
+    pub(crate) fn new(rx: SpscConsumer<MeterSnapshot>, recycle: SpscProducer<MeterSnapshot>) -> Self {
+        Self { rx, recycle }
+    }
+
+    pub(crate) fn take(&mut self, out: &mut MeterSnapshot) {
+        let mut fresh = false;
+        while let Some(mut snapshot) = self.rx.pop() {
+            if snapshot.clear_previous {
+                out.reset_levels();
+                fresh = false;
+            }
+            if !fresh {
+                take_meter_snapshot(&mut snapshot, out);
+                fresh = true;
+            } else {
+                out.accumulate(&snapshot.main, &snapshot.tracks);
+            }
+            snapshot.reset_levels();
+            let _ = self.recycle.push(snapshot);
+        }
+    }
 }
 
 impl Side {

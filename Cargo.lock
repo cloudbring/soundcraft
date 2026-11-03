@@ -1068,6 +1068,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-audio-rt"
+version = "0.1.0"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F41-craft-audio-rt#6fbc2cddfe07d574d8f45db6da9e32207a59bd75"
+dependencies = [
+ "rtrb",
+]
+
+[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
@@ -3836,6 +3844,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "323c417e1d9665a65b263ec744ba09030cfb277e9daa0b018a4ab62e57bc8189"
 
 [[package]]
+name = "rtrb"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "342e1478a6e1c839e7405033eabfdc954d4d5dabd39f34e83420a43a95acfb04"
+
+[[package]]
 name = "rubato"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4448,6 +4462,7 @@ dependencies = [
 name = "soundcraft-mix"
 version = "0.17.0"
 dependencies = [
+ "allocation-counter",
  "log",
  "rayon",
  "soundcraft-au-host",
@@ -4479,6 +4494,7 @@ version = "0.17.0"
 dependencies = [
  "allocation-counter",
  "cpal",
+ "craft-audio-rt",
  "log",
  "rubato",
  "serde",

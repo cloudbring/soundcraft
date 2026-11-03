@@ -8,6 +8,8 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+# TODO(#41): repoint to storytold/craft-libs once craft-audio-rt merges
+craft-audio-rt = { git = "https://github.com/cloudbring/craft-libs", branch = "algo/41-craft-audio-rt" }
 soundcraft-time.workspace = true
 soundcraft-audio-io.workspace = true
 soundcraft-model.workspace = true

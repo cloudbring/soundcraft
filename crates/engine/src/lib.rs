@@ -538,6 +538,9 @@ fn install_panic_hook() {
     ONCE.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            if soundcraft_mix::on_audio_thread() {
+                return;
+            }
             log::error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
             prev(info);
         }));

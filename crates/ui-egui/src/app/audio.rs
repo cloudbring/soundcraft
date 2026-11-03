@@ -64,7 +64,9 @@ impl SoundApp {
             OutputTrouble::Gone => {
                 (format!("“{name}” is unavailable"), "Check the audio device, then use Reconnect audio device in Setup › Playback Engine.")
             }
-            OutputTrouble::Stalled => (format!("“{name}” stopped asking for audio"), "Use Reconnect audio device in Setup › Playback Engine."),
+            OutputTrouble::Stalled => {
+                (format!("“{name}” stopped asking for audio ({} stalls)", p.stall_count()), "Use Reconnect audio device in Setup › Playback Engine.")
+            }
         };
         let (recording, playing) = (self.engine.transport.recording, self.engine.transport.playing);
         if recording || playing {
