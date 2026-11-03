@@ -6,12 +6,114 @@ use crate::params::{Params, choice, lin, log, param_plumbing, toggle};
 use crate::util::{DcBlocker, Rng, Smoother, flush, frames_in, sane_channels, sane_sr, time_coef};
 use crate::{Category, ParamInfo, Plugin, PluginInfo, Unit, db_to_gain};
 
-static SAT_PARAMS: [ParamInfo; 5] = [
+const FIR_LEN: usize = 65;
+const OVERSAMPLING: &[&str] = &["Off", "2x", "4x"];
+
+#[derive(Clone)]
+struct HalfBand {
+    coeff: [f32; FIR_LEN],
+    history: [f32; FIR_LEN],
+    pos: usize,
+}
+
+impl HalfBand {
+    fn new() -> Self {
+        let mut coeff = [0.0; FIR_LEN];
+        let mid = (FIR_LEN / 2) as f64;
+        for (index, value) in coeff.iter_mut().enumerate() {
+            let offset = index as f64 - mid;
+            let sinc = if offset == 0.0 { 0.5 } else { (std::f64::consts::FRAC_PI_2 * offset).sin() / (std::f64::consts::PI * offset) };
+            let phase = std::f64::consts::TAU * index as f64 / (FIR_LEN - 1) as f64;
+            let window = 0.42 - 0.5 * phase.cos() + 0.08 * (2.0 * phase).cos();
+            *value = (sinc * window) as f32;
+        }
+        let sum: f32 = coeff.iter().sum();
+        coeff.iter_mut().for_each(|value| *value /= sum);
+        Self { coeff, history: [0.0; FIR_LEN], pos: 0 }
+    }
+
+    fn process(&mut self, sample: f32) -> f32 {
+        self.history[self.pos] = sample;
+        let mut output = 0.0;
+        for (index, coeff) in self.coeff.iter().enumerate() {
+            output += coeff * self.history[(self.pos + FIR_LEN - index) % FIR_LEN];
+        }
+        self.pos = (self.pos + 1) % FIR_LEN;
+        flush(output)
+    }
+}
+
+#[derive(Clone)]
+struct WaveChannel {
+    up: [HalfBand; 2],
+    down: [HalfBand; 2],
+    dry: [f32; 49],
+    pos: usize,
+    mode: usize,
+}
+
+impl WaveChannel {
+    fn new() -> Self {
+        Self { up: [HalfBand::new(), HalfBand::new()], down: [HalfBand::new(), HalfBand::new()], dry: [0.0; 49], pos: 0, mode: 2 }
+    }
+
+    fn latency(mode: usize) -> usize {
+        match mode {
+            1 => 32,
+            2 => 48,
+            _ => 0,
+        }
+    }
+
+    fn process(&mut self, input: f32, dry_input: f32, mode: usize, shape: impl Fn(f32) -> f32) -> (f32, f32) {
+        if self.mode != mode {
+            for filter in self.up.iter_mut().chain(self.down.iter_mut()) {
+                filter.history.fill(0.0);
+                filter.pos = 0;
+            }
+            self.dry.fill(0.0);
+            self.pos = 0;
+            self.mode = mode;
+        }
+        let latency = Self::latency(mode);
+        self.dry[self.pos] = dry_input;
+        let dry = self.dry[(self.pos + self.dry.len() - latency) % self.dry.len()];
+        self.pos = (self.pos + 1) % self.dry.len();
+        if mode == 0 {
+            return (dry, shape(input));
+        }
+        let mut result = 0.0;
+        for phase in 0..2 {
+            let up = self.up[0].process(if phase == 0 { input * 2.0 } else { 0.0 });
+            let shaped = if mode == 1 {
+                shape(up)
+            } else {
+                let mut inner = 0.0;
+                for inner_phase in 0..2 {
+                    let sample = self.up[1].process(if inner_phase == 0 { up * 2.0 } else { 0.0 });
+                    let filtered = self.down[1].process(shape(sample));
+                    if inner_phase == 0 {
+                        inner = filtered;
+                    }
+                }
+                inner
+            };
+            let filtered = self.down[0].process(shaped);
+            if phase == 0 {
+                result = filtered;
+            }
+        }
+        (dry, result)
+    }
+}
+
+static SAT_PARAMS: [ParamInfo; 6] = [
     lin("drive", "Drive", 0.0, 36.0, 6.0, Unit::Db),
     lin("bias", "Asymmetry", 0.0, 100.0, 0.0, Unit::Percent),
     log("tone", "Tone", 1000.0, 20000.0, 20000.0, Unit::Hz),
     lin("mix", "Mix", 0.0, 100.0, 100.0, Unit::Percent),
     lin("output", "Output", -24.0, 12.0, 0.0, Unit::Db),
+    choice("oversampling", "Oversampling", OVERSAMPLING, 2),
 ];
 
 pub static SAT_INFO: PluginInfo = PluginInfo {
@@ -31,6 +133,7 @@ pub struct Saturator {
     sr: f32,
     dc: Vec<DcBlocker>,
     lp: Vec<f32>,
+    waves: Vec<WaveChannel>,
     drive: Smoother,
     bias: Smoother,
     mix: Smoother,
@@ -51,6 +154,7 @@ impl Saturator {
             sr: 48_000.0,
             dc: Vec::new(),
             lp: Vec::new(),
+            waves: Vec::new(),
             drive: Smoother::new(1.0),
             bias: Smoother::new(0.0),
             mix: Smoother::new(1.0),
@@ -79,6 +183,7 @@ impl Plugin for Saturator {
         let ch = sane_channels(channels);
         self.dc = vec![DcBlocker::new(10.0, self.sr); ch];
         self.lp = vec![0.0; ch];
+        self.waves = vec![WaveChannel::new(); ch];
         for s in [&mut self.drive, &mut self.bias, &mut self.mix, &mut self.out] {
             s.set_time(20.0, self.sr);
         }
@@ -89,6 +194,7 @@ impl Plugin for Saturator {
     fn reset(&mut self) {
         self.dc.iter_mut().for_each(DcBlocker::reset);
         self.lp.iter_mut().for_each(|v| *v = 0.0);
+        self.waves.iter_mut().for_each(|wave| *wave = WaveChannel::new());
         for s in [&mut self.drive, &mut self.bias, &mut self.mix, &mut self.out] {
             s.snap();
         }
@@ -98,6 +204,7 @@ impl Plugin for Saturator {
         let ch = self.dc.len().min(io.len());
         let frames = frames_in(io, frames, ch);
         let a = self.tone;
+        let mode = self.p.choice(5);
         for n in 0..frames {
             let g = self.drive.next();
             let b = self.bias.next();
@@ -106,10 +213,15 @@ impl Plugin for Saturator {
             let tb = b.tanh();
             let norm = 1.0 / ((g + b).tanh() - tb).max(1e-3);
             for c in 0..ch {
-                let (Some(buf), Some(dc), Some(lp)) = (io.get_mut(c), self.dc.get_mut(c), self.lp.get_mut(c)) else { continue };
+                let (Some(buf), Some(dc), Some(lp), Some(wave)) = (io.get_mut(c), self.dc.get_mut(c), self.lp.get_mut(c), self.waves.get_mut(c))
+                else {
+                    continue;
+                };
                 let Some(x) = buf.get_mut(n) else { continue };
                 let dry = if x.is_finite() { *x } else { 0.0 };
-                let mut y = ((g * dry + b).tanh() - tb) * norm;
+                let (dry, shaped) = wave.process(dry, dry, mode, |sample| ((g * sample + b).tanh() - tb) * norm);
+                let strength = (g - 1.0).clamp(0.0, 1.0).max((b * 2.0).clamp(0.0, 1.0));
+                let mut y = dry + (shaped - dry) * strength;
                 if b > 0.0 {
                     y = dc.process(y);
                 }
@@ -120,6 +232,10 @@ impl Plugin for Saturator {
                 *x = (dry * (1.0 - m) + y * m) * o;
             }
         }
+    }
+
+    fn latency(&self) -> usize {
+        WaveChannel::latency(self.p.choice(5))
     }
 }
 
@@ -229,10 +345,11 @@ impl Plugin for LoFi {
 
 // ---------------------------------------------------------------------------------------------
 
-static RECT_PARAMS: [ParamInfo; 3] = [
+static RECT_PARAMS: [ParamInfo; 4] = [
     choice("mode", "Mode", &["Half Wave", "Full Wave"], 1),
     lin("mix", "Mix", 0.0, 100.0, 100.0, Unit::Percent),
     lin("output", "Output", -24.0, 12.0, 0.0, Unit::Db),
+    choice("oversampling", "Oversampling", OVERSAMPLING, 2),
 ];
 
 pub static RECT_INFO: PluginInfo = PluginInfo {
@@ -250,6 +367,7 @@ pub struct Rectifier {
     p: Params,
     sr: f32,
     dc: Vec<DcBlocker>,
+    waves: Vec<WaveChannel>,
     mix: Smoother,
     out: Smoother,
 }
@@ -262,7 +380,8 @@ impl Default for Rectifier {
 
 impl Rectifier {
     pub fn new() -> Self {
-        let mut r = Self { p: Params::new(&RECT_PARAMS), sr: 48_000.0, dc: Vec::new(), mix: Smoother::new(1.0), out: Smoother::new(1.0) };
+        let mut r =
+            Self { p: Params::new(&RECT_PARAMS), sr: 48_000.0, dc: Vec::new(), waves: Vec::new(), mix: Smoother::new(1.0), out: Smoother::new(1.0) };
         r.update();
         r
     }
@@ -279,6 +398,7 @@ impl Plugin for Rectifier {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize, channels: usize) {
         self.sr = sane_sr(sample_rate);
         self.dc = vec![DcBlocker::new(10.0, self.sr); sane_channels(channels)];
+        self.waves = vec![WaveChannel::new(); self.dc.len()];
         self.mix.set_time(20.0, self.sr);
         self.out.set_time(20.0, self.sr);
         self.update();
@@ -287,6 +407,7 @@ impl Plugin for Rectifier {
 
     fn reset(&mut self) {
         self.dc.iter_mut().for_each(DcBlocker::reset);
+        self.waves.iter_mut().for_each(|wave| *wave = WaveChannel::new());
         self.mix.snap();
         self.out.snap();
     }
@@ -295,18 +416,22 @@ impl Plugin for Rectifier {
         let ch = self.dc.len().min(io.len());
         let frames = frames_in(io, frames, ch);
         let full = self.p.choice(0) == 1;
+        let mode = self.p.choice(3);
         for n in 0..frames {
             let m = self.mix.next();
             let o = self.out.next();
             for c in 0..ch {
-                let (Some(buf), Some(dc)) = (io.get_mut(c), self.dc.get_mut(c)) else { continue };
+                let (Some(buf), Some(dc), Some(wave)) = (io.get_mut(c), self.dc.get_mut(c), self.waves.get_mut(c)) else { continue };
                 let Some(x) = buf.get_mut(n) else { continue };
                 let dry = if x.is_finite() { *x } else { 0.0 };
-                let r = if full { dry.abs() } else { dry.max(0.0) };
+                let (dry, r) = wave.process(dry, dry, mode, |sample| if full { sample.abs() } else { sample.max(0.0) });
                 let wet = dc.process(r);
                 *x = (dry * (1.0 - m) + wet * m) * o;
             }
         }
+    }
+    fn latency(&self) -> usize {
+        WaveChannel::latency(self.p.choice(3))
     }
 }
 
@@ -329,7 +454,7 @@ const SUB_ENV_RELEASE_MS: f32 = 50.0;
 /// Bias of the asymmetric Distort I curve.
 const SUB_ASYM: f32 = 0.25;
 
-static SUB_PARAMS: [ParamInfo; 17] = [
+static SUB_PARAMS: [ParamInfo; 18] = [
     lin("input", "Input", -18.0, 18.0, 0.0, Unit::Db),
     choice("range", "Range", SUB_RANGES, 2),
     lin("lower_gain", "Lower Gain", SUB_OFF_DB, 24.0, 0.0, Unit::Db),
@@ -347,6 +472,7 @@ static SUB_PARAMS: [ParamInfo; 17] = [
     lin("mix", "Mix", 0.0, 100.0, 50.0, Unit::Percent),
     toggle("wet_solo", "Wet Solo", false),
     lin("output", "Output", -18.0, 18.0, 0.0, Unit::Db),
+    choice("oversampling", "Oversampling", OVERSAMPLING, 2),
 ];
 
 pub static SUB_INFO: PluginInfo = PluginInfo {
@@ -443,6 +569,7 @@ pub struct SubHarmonic {
     p: Params,
     sr: f32,
     ch: Vec<SubChannel>,
+    waves: Vec<WaveChannel>,
     input: Smoother,
     bands: [Smoother; 3],
     drive: Smoother,
@@ -464,6 +591,7 @@ impl SubHarmonic {
             p: Params::new(&SUB_PARAMS),
             sr: 48_000.0,
             ch: Vec::new(),
+            waves: Vec::new(),
             input: Smoother::new(1.0),
             bands: [Smoother::new(0.0); 3],
             drive: Smoother::new(1.0),
@@ -542,6 +670,7 @@ impl Plugin for SubHarmonic {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize, channels: usize) {
         self.sr = sane_sr(sample_rate);
         self.ch = vec![SubChannel::new(self.sr); sane_channels(channels)];
+        self.waves = vec![WaveChannel::new(); self.ch.len()];
         let sr = self.sr;
         for s in self.smoothers() {
             s.set_time(20.0, sr);
@@ -552,6 +681,7 @@ impl Plugin for SubHarmonic {
 
     fn reset(&mut self) {
         self.ch.iter_mut().for_each(SubChannel::reset);
+        self.waves.iter_mut().for_each(|wave| *wave = WaveChannel::new());
         for s in self.smoothers() {
             s.snap();
         }
@@ -561,6 +691,7 @@ impl Plugin for SubHarmonic {
         let ch = self.ch.len().min(io.len());
         let frames = frames_in(io, frames, ch);
         let character = self.p.choice(9);
+        let mode = self.p.choice(17);
         let rel = self.env_rel;
         for n in 0..frames {
             let gin = self.input.next();
@@ -570,14 +701,14 @@ impl Plugin for SubHarmonic {
             let wg = self.wet.next();
             let o = self.out.next();
             for c in 0..ch {
-                let (Some(buf), Some(st)) = (io.get_mut(c), self.ch.get_mut(c)) else { continue };
+                let (Some(buf), Some(st), Some(wave)) = (io.get_mut(c), self.ch.get_mut(c), self.waves.get_mut(c)) else { continue };
                 let Some(x) = buf.get_mut(n) else { continue };
                 let dry = if x.is_finite() { *x * gin } else { 0.0 };
                 let mut sum = st.direct.process_sample(dry) * g[2];
                 for (band, gain) in st.bands.iter_mut().zip(g) {
                     sum += band.process(dry, rel) * gain;
                 }
-                let mut y = sub_saturate(character, sum * drive);
+                let (dry, mut y) = wave.process(sum * drive, dry, mode, |sample| sub_saturate(character, sample));
                 if character == 4 {
                     y = st.dc.process(y);
                 }
@@ -587,11 +718,103 @@ impl Plugin for SubHarmonic {
         }
     }
 
+    fn latency(&self) -> usize {
+        WaveChannel::latency(self.p.choice(17))
+    }
+
     fn tail_samples(&self) -> usize {
         // Time for the slowest, most resonant filter to ring down by 60 dB (6.9 time constants).
         let (lo, _) = self.range_hz();
         let f = self.p.v(10).min(self.p.v(12)).min(lo * SUB_SMOOTH).max(1.0);
         let q = self.p.v(11).max(self.p.v(13)).max(self.smooth_q()).max(SUB_BAND_Q);
         (6.9 * q / (std::f32::consts::PI * f) * self.sr) as usize
+    }
+}
+
+#[cfg(test)]
+mod oversampling_tests {
+    use super::*;
+    use rustfft::{FftPlanner, num_complex::Complex};
+
+    const SIZE: usize = 1 << 14;
+
+    fn alias_energy(drive: f32, mode: f32) -> f64 {
+        let mut plugin = Saturator::new();
+        plugin.set_param("drive", drive);
+        plugin.set_param("oversampling", mode);
+        plugin.prepare(48_000.0, SIZE + 4096, 1);
+        let mut audio = vec![(0..SIZE + 4096).map(|index| (std::f64::consts::TAU * 1051.0 * index as f64 / SIZE as f64).sin() as f32).collect()];
+        plugin.process(&mut audio, SIZE + 4096);
+        let mut spectrum: Vec<Complex<f64>> = audio[0][4096..]
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let phase = std::f64::consts::TAU * index as f64 / (SIZE - 1) as f64;
+                let window = 0.35875 - 0.48829 * phase.cos() + 0.14128 * (2.0 * phase).cos() - 0.01168 * (3.0 * phase).cos();
+                Complex::new(f64::from(*value) * window, 0.0)
+            })
+            .collect();
+        FftPlanner::new().plan_fft_forward(SIZE).process(&mut spectrum);
+        spectrum
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let frequency = *index as f64 * 48_000.0 / SIZE as f64;
+                (50.0..=23_500.0).contains(&frequency) && !(1..=7).any(|harmonic| (*index as isize - (harmonic * 1051) as isize).abs() <= 3)
+            })
+            .map(|(_, value)| value.norm_sqr())
+            .sum()
+    }
+
+    #[test]
+    fn alias_reduction() {
+        let mut passed = true;
+        for drive in [12.0, 24.0] {
+            let baseline = alias_energy(drive, 0.0);
+            let two = 10.0 * (baseline / alias_energy(drive, 1.0)).log10();
+            let four = 10.0 * (baseline / alias_energy(drive, 2.0)).log10();
+            eprintln!("drive {drive} dB: 2x {two:.2} dB, 4x {four:.2} dB");
+            passed &= four >= 20.0;
+        }
+        assert!(passed, "4x alias reduction below 20 dB");
+    }
+
+    #[test]
+    fn zero_drive_null_and_group_delay() {
+        for mode in 0..=2 {
+            let mut plugin = Saturator::new();
+            plugin.set_param("drive", 0.0);
+            plugin.set_param("oversampling", mode as f32);
+            plugin.prepare(48_000.0, 512, 1);
+            let input: Vec<f32> = (0..512).map(|index| (index as f32 * 0.123).sin() * 0.5).collect();
+            let mut audio = vec![input.clone()];
+            plugin.process(&mut audio, input.len());
+            for index in plugin.latency()..input.len() {
+                assert!((audio[0][index] - input[index - plugin.latency()]).abs() < 1e-6);
+            }
+            let mut wave = WaveChannel::new();
+            let impulse: Vec<f32> = (0..200).map(|index| wave.process(if index == 0 { 1.0 } else { 0.0 }, 0.0, mode, |sample| sample).1).collect();
+            let measured = impulse.iter().enumerate().max_by(|left, right| left.1.abs().total_cmp(&right.1.abs())).map(|(index, _)| index).unwrap();
+            assert_eq!(measured, plugin.latency());
+        }
+    }
+
+    #[test]
+    fn dry_mix_and_latency_for_all_waveshapers() {
+        for id in ["saturator", "rectifier", "subharmonic"] {
+            for mode in 0..=2 {
+                let mut plugin = crate::create(id).unwrap();
+                plugin.set_param("mix", 0.0);
+                plugin.set_param("oversampling", mode as f32);
+                plugin.prepare(48_000.0, 256, 1);
+                let input: Vec<f32> = (0..256).map(|index| (index as f32 * 0.13).sin() * 0.2).collect();
+                let mut audio = vec![input.clone()];
+                plugin.process(&mut audio, input.len());
+                assert_eq!(plugin.latency(), WaveChannel::latency(mode));
+                for index in plugin.latency()..input.len() {
+                    assert!((audio[0][index] - input[index - plugin.latency()]).abs() < 1e-6, "{id} mode {mode}");
+                }
+            }
+        }
     }
 }

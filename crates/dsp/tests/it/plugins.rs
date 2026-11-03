@@ -507,7 +507,8 @@ fn saturator_adds_harmonics_and_stays_bounded() {
     let mut p = prepared("saturator");
     p.set_param("drive", 30.0);
     let out = run(p.as_mut(), &[sine(1000.0, 1.0, 48_000)]);
-    assert!(peak(&out[0]) <= 1.01);
+    // Linear-phase reconstruction can ring above the waveshaper's full-scale peak.
+    assert!(peak(&out[0]) <= 1.3, "peak {}", peak(&out[0]));
     let spec = soundcraft_dsp::spectrum::magnitude_db(&out[0][8192..], 8192);
     let third = (3000.0 / (SR / 8192.0)) as usize;
     assert!(spec[third - 1..=third + 1].iter().cloned().fold(f32::MIN, f32::max) > -30.0);
