@@ -44,6 +44,7 @@ pub(crate) struct Strip {
     pub(crate) gr: f32,
     /// Per-clip effect chains (Clip Effects) and a scratch buffer to render clips into.
     pub(crate) clip_fx: HashMap<u64, ClipFx>,
+    pub(crate) clip_index: ClipIndex,
     clipbuf: Vec<Vec<f32>>,
     /// Total latency of the active inserts (samples).
     pub(crate) latency: usize,
@@ -54,6 +55,50 @@ pub(crate) struct Strip {
     pub(crate) out_extra: DelayLine,
     pub(crate) outbuf: Vec<Vec<f32>>,
     pub(crate) failures: PluginFailures,
+}
+
+#[derive(Default)]
+pub(crate) struct ClipIndex {
+    max_end: Vec<Samples>,
+    first: usize,
+    last_end: Option<Samples>,
+}
+
+impl ClipIndex {
+    pub(crate) fn rebuild(&mut self, clips: &[super::Clip]) {
+        self.max_end.clear();
+        self.max_end.reserve(clips.len());
+        let mut max_end = Samples::MIN;
+        let mut previous_start = Samples::MIN;
+        for clip in clips {
+            debug_assert!(clip.start >= previous_start, "playlist clips must be sorted by start");
+            previous_start = clip.start;
+            max_end = max_end.max(clip.end());
+            self.max_end.push(max_end);
+        }
+        self.first = 0;
+        self.last_end = None;
+    }
+
+    pub(crate) fn overlapping<'a>(&mut self, clips: &'a [super::Clip], block: Range) -> impl Iterator<Item = &'a super::Clip> {
+        if self.max_end.len() != clips.len() {
+            self.rebuild(clips);
+        }
+        if self.last_end != Some(block.start) {
+            self.first = self.max_end.partition_point(|&end| end <= block.start);
+        } else {
+            while self.max_end.get(self.first).is_some_and(|&end| end <= block.start) {
+                self.first += 1;
+            }
+        }
+        self.last_end = Some(block.end);
+        clips
+            .get(self.first..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(move |clip| clip.start < block.end)
+            .filter(move |clip| clip.range().overlaps(&block))
+    }
 }
 
 /// Most latency delay compensation handles: 2^20 samples, about 22 s at 48 kHz. A strip reports
@@ -141,6 +186,7 @@ impl Strip {
             muted: false,
             gr: 0.0,
             clip_fx: HashMap::new(),
+            clip_index: ClipIndex::default(),
             clipbuf: Vec::new(),
             latency: 0,
             align: DelayLine::default(),
@@ -240,8 +286,8 @@ fn monitor_input(t: &Track, strip: &mut Strip, live: &LiveInput<'_>, frames: usi
 fn render_audio_clips(s: &Session, t: &Track, strip: &mut Strip, blk: Block) {
     let Block { pos, frames, .. } = blk;
     let block = Range { start: pos, end: pos.saturating_add(frames as i64) };
-    for clip in t.clips() {
-        if clip.muted || !clip.is_audio() || !clip.range().overlaps(&block) {
+    for clip in strip.clip_index.overlapping(t.clips(), block) {
+        if clip.muted || !clip.is_audio() {
             continue;
         }
         match clip_fx_params(s, clip.id.0) {

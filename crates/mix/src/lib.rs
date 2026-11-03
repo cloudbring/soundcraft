@@ -120,6 +120,8 @@ pub struct MixEngine {
     last_end: Samples,
     /// Snapshot key of the session the strips/order were synced to.
     synced: (usize, usize, usize),
+    /// Session snapshots change identity when edited by the host.
+    indexed_session: usize,
     order: Vec<usize>,
     /// Current total compensation delay (samples) of the main mix: the slowest track and aux
     /// returns, and the master faders' inserts.
@@ -167,6 +169,7 @@ impl MixEngine {
             pan_law: PanLaw::Minus3,
             last_end: 0,
             synced: (0, 0, 0),
+            indexed_session: 0,
             order: Vec::new(),
             latency: 0,
             track_latency: 0,
@@ -285,6 +288,7 @@ impl MixEngine {
         for t in &s.tracks {
             let ch = strip_channels(t, main_ch);
             let strip = self.strips.entry(t.id).or_insert_with(Strip::new);
+            strip.clip_index.rebuild(t.clips());
             if strip.buf.len() != ch || strip.buf.first().map_or(0, Vec::len) != mb {
                 strip.buf = vec![vec![0.0; mb]; ch];
             }
@@ -349,6 +353,14 @@ impl MixEngine {
             self.sync(s);
             self.order = processing_order(s);
             self.synced = key;
+            self.indexed_session = std::ptr::from_ref(s) as usize;
+        } else if self.indexed_session != std::ptr::from_ref(s) as usize {
+            for track in &s.tracks {
+                if let Some(strip) = self.strips.get_mut(&track.id) {
+                    strip.clip_index.rebuild(track.clips());
+                }
+            }
+            self.indexed_session = std::ptr::from_ref(s) as usize;
         }
     }
 
