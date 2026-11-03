@@ -41,10 +41,12 @@ rayon = "1"
 # Whether an output path is one of the inputs (the CLI refuses to replace an input unless asked).
 same-file = "1"
 proptest = "1"
+allocation-counter = "0.8.1"
 
 # audio
 symphonia = { version = "0.6", default-features = false, features = ["mp1", "mp2", "mp3", "flac", "vorbis", "ogg", "wav", "pcm", "aiff", "isomp4", "aac", "alac", "adpcm", "caf", "mkv"] }
 rustfft = "6"
+rubato = { version = "0.16.2", default-features = false }
 # Session bundles (one file holding a session and its audio, for the browser): stored entries only.
 zip = { version = "9", default-features = false }
 cpal = "0.18"

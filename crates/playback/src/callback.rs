@@ -77,6 +77,9 @@ pub(crate) struct AudioState {
     fold: [(f32, f32); MAX_CHANNELS],
     pub(crate) pending_len: usize,
     read: f64,
+    resampler: super::resample::SincResampler,
+    consumed: usize,
+    tail_remaining: usize,
     pub(crate) device_rate: f64,
     input: Option<Arc<record::InputRing>>,
     recording: bool,
@@ -122,6 +125,9 @@ impl AudioState {
             pending: vec![vec![0.0; BLOCK]; nch],
             pending_len: 0,
             read: 0.0,
+            resampler: super::resample::SincResampler::new(MAX_CHANNELS),
+            consumed: 0,
+            tail_remaining: 0,
             device_rate,
             input: None,
             recording: false,
@@ -147,17 +153,24 @@ impl AudioState {
                 Cmd::Recording(r) => self.recording = r,
                 Cmd::Session(s, instances) => {
                     changed = true;
-                    if (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5 {
+                    let rate_changed = (s.sample_rate.as_f64() - self.session.sample_rate.as_f64()).abs() > 0.5;
+                    if rate_changed {
                         let mut old = std::mem::replace(&mut self.mix, new_engine(s.sample_rate.as_f64() as f32));
                         let _ = self.garbage.send(old.drain_plugins());
                     }
                     self.mix.adopt(instances);
                     // The main format changed (a document edit, not steady state): resize.
                     let nch = main_channels(&s);
-                    if self.pending.len() != nch {
+                    let channels_changed = self.pending.len() != nch;
+                    if channels_changed {
                         self.pending = vec![vec![0.0; BLOCK]; nch];
+                    }
+                    if rate_changed || channels_changed {
                         self.pending_len = 0;
                         self.read = 0.0;
+                        self.consumed = 0;
+                        self.tail_remaining = 0;
+                        self.resampler.reset();
                     }
                     self.fold = fold_gains(&s);
                     let old = std::mem::replace(&mut self.session, s);
@@ -173,18 +186,26 @@ impl AudioState {
                     self.playing = true;
                     self.pending_len = 0;
                     self.read = 0.0;
+                    self.consumed = 0;
+                    self.tail_remaining = 0;
+                    self.resampler.reset();
                     self.mix.reset();
                 }
                 Cmd::Stop => {
                     self.playing = false;
                     self.end = None;
                     self.looped = None;
+                    self.tail_remaining = 0;
+                    self.resampler.reset();
                     self.mix.reset();
                 }
                 Cmd::Locate(at) => {
                     self.pos = at;
                     self.pending_len = 0;
                     self.read = 0.0;
+                    self.consumed = 0;
+                    self.tail_remaining = 0;
+                    self.resampler.reset();
                     self.mix.reset();
                 }
             }
@@ -206,8 +227,13 @@ impl AudioState {
     }
 
     /// Render the next block at the session rate into `pending`.
-    fn render_next(&mut self, quantum: usize) {
+    fn render_next(&mut self, quantum: usize, resampling: bool) {
         let mut n = quantum.clamp(1, BLOCK);
+        if !self.playing && self.tail_remaining > 0 {
+            self.pending.iter_mut().for_each(|channel| channel.fill(0.0));
+            self.pending_len = n;
+            return;
+        }
         if let Some(l) = self.looped
             && self.pos >= l.end
         {
@@ -220,6 +246,7 @@ impl AudioState {
                 self.playing = false;
                 self.end = None;
                 self.shared.playing.store(false, Ordering::Relaxed);
+                self.tail_remaining = if resampling { 2 * super::resample::DELAY } else { 0 };
                 n = 0;
             } else {
                 n = n.min(usize::try_from(e - self.pos).unwrap_or(BLOCK));
@@ -277,7 +304,7 @@ impl AudioState {
         self.drain();
         let channels = channels.max(1);
         let monitoring = self.input.is_some() && self.session.tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm);
-        if !self.playing && !monitoring {
+        if !self.playing && !monitoring && self.tail_remaining == 0 {
             out.iter_mut().for_each(|x| *x = 0.0);
             self.unsent.silence();
             self.forget_meters();
@@ -288,32 +315,43 @@ impl AudioState {
         }
         let speed = f64::from(self.shared.speed.load(Ordering::Relaxed)) / 1000.0;
         let step = self.session.sample_rate.as_f64() / self.device_rate.max(1.0) * speed.clamp(0.1, 4.0);
+        let bypass = step == 1.0;
+        self.resampler.set_step(step);
         let callback_frames = out.len() / channels;
         let quantum = ((callback_frames as f64 * step).ceil() as usize).clamp(1, BLOCK);
         for frame in out.chunks_mut(channels) {
             while self.read >= self.pending_len as f64 {
+                self.consume(self.pending_len);
                 self.read -= self.pending_len as f64;
-                if !self.playing && !monitoring {
+                if !self.playing && !monitoring && self.tail_remaining == 0 {
                     break;
                 }
-                self.render_next(quantum);
+                self.render_next(quantum, !bypass);
+                self.consumed = 0;
                 if self.pending_len == 0 {
                     break;
                 }
             }
             let i0 = self.read.floor() as usize;
-            let fr = (self.read - i0 as f64) as f32;
-            let sounding = self.playing || monitoring;
+            let fr = self.read - i0 as f64;
+            self.consume(i0.saturating_add(1).min(self.pending_len));
+            let sounding = self.playing || monitoring || self.tail_remaining > 0;
             let nch = self.pending.len();
             let sample = |c: usize| {
-                let ch = self.pending.get(c);
-                let a = ch.and_then(|v| v.get(i0)).copied().unwrap_or(0.0);
-                // `pending` is BLOCK long; only `pending_len` frames are valid. Hold the last one at the edge.
-                let b = if i0 + 1 < self.pending_len { ch.and_then(|v| v.get(i0 + 1)).copied().unwrap_or(a) } else { a };
-                a * (1.0 - fr) + b * fr
+                if bypass { self.pending.get(c).and_then(|samples| samples.get(i0)).copied().unwrap_or(0.0) } else { self.resampler.sample(c, fr) }
             };
             write_frame(frame, channels, nch, sounding, &self.fold, sample);
             self.read += step;
+        }
+    }
+
+    fn consume(&mut self, end: usize) {
+        while self.consumed < end {
+            self.resampler.push(&self.pending, self.consumed);
+            self.consumed += 1;
+            if !self.playing {
+                self.tail_remaining = self.tail_remaining.saturating_sub(1);
+            }
         }
     }
 }

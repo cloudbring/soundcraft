@@ -315,6 +315,10 @@ fn short_device_callbacks_render_short_mix_blocks() {
 }
 
 fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec<f32>>) -> AudioState {
+    audio_output_state_with_end(format, channels, None)
+}
+
+fn audio_output_state_with_end(format: soundcraft_model::ChannelFormat, channels: Vec<Vec<f32>>, end: Option<Samples>) -> AudioState {
     use soundcraft_model::{Clip, SourceAudio, SourceId, TrackKind};
     let mut s = Session::default();
     s.edit.click = false;
@@ -332,7 +336,7 @@ fn audio_output_state(format: soundcraft_model::ChannelFormat, channels: Vec<Vec
     });
     let (tx, rx) = channel();
     let st = AudioState::new(rx, shared, Arc::new(s), 48_000.0, channel().0);
-    tx.send(Cmd::Play { from: 0, end: None, looped: None }).unwrap();
+    tx.send(Cmd::Play { from: 0, end, looped: None }).unwrap();
     st
 }
 
@@ -369,13 +373,103 @@ fn resampling_at_a_short_block_edge_does_not_mix_in_stale_frames() {
     st.fill(&mut long, 2);
     assert_eq!(st.pending_len, BLOCK);
     let mut short = [0.0; 2 * 8];
-    for call in 0..20 {
+    for call in 0..40 {
         st.fill(&mut short, 2);
         assert!(st.pending_len < BLOCK);
-        // The first frame of the first short call still reads the DC block's last frame.
-        let from = if call == 0 { 2 } else { 0 };
-        assert!(short[from..].iter().all(|x| x.abs() < 1e-6), "call {call}: {short:?}");
+        if call >= 32 {
+            assert!(short.iter().all(|x| x.abs() < 1e-6), "call {call}: {short:?}");
+        }
     }
+}
+
+#[test]
+fn sinc_callback_is_independent_of_device_block_size() {
+    use soundcraft_model::ChannelFormat;
+    let source: Vec<_> = (0..12_000).map(|frame| (std::f64::consts::TAU * 1000.0 * frame as f64 / 48_000.0).sin() as f32 * 0.5).collect();
+    let render = |blocks: &[usize], speed: u32| {
+        let mut state = audio_output_state(ChannelFormat::Stereo, vec![source.clone(), source.clone()]);
+        state.device_rate = 44_100.0;
+        state.shared.speed.store(speed, Ordering::Relaxed);
+        let mut result = Vec::new();
+        let mut block = 0;
+        while result.len() < 4410 {
+            let frames = blocks[block % blocks.len()].min(4410 - result.len());
+            let mut buffer = vec![0.0; 2 * frames];
+            state.fill(&mut buffer, 2);
+            result.extend(buffer.as_chunks::<2>().0.iter().map(|frame| frame[0]));
+            block += 1;
+        }
+        result
+    };
+    for speed in [100, 1000, 4000] {
+        let reference = render(&[512], speed);
+        let variable = render(&[1, 7, 64, 333, 1024], speed);
+        for (frame, (left, right)) in reference.iter().zip(variable).enumerate() {
+            assert!((left - right).abs() < 1e-6, "speed {speed}, frame {frame}: {left} vs {right}");
+        }
+    }
+}
+
+#[test]
+fn converted_playback_flushes_its_tail_without_advancing_transport() {
+    use soundcraft_model::ChannelFormat;
+    let mut source = vec![0.0; 1000];
+    source[999] = 0.5;
+    let mut state = audio_output_state_with_end(ChannelFormat::Stereo, vec![source.clone(), source], Some(1000));
+    state.device_rate = 44_100.0;
+    let mut output = vec![0.0; 2 * 1500];
+    state.fill(&mut output, 2);
+    let peak = output.as_chunks::<2>().0.iter().enumerate().max_by(|left, right| left.1[0].abs().total_cmp(&right.1[0].abs())).unwrap();
+    let expected = (999 + resample::DELAY) as f64 * 44_100.0 / 48_000.0;
+    assert!((peak.0 as f64 - expected).abs() < 1.0);
+    assert!(peak.1[0] > 0.2);
+    assert_eq!(state.shared.position.load(Ordering::Relaxed), 1000);
+    assert!(!state.shared.playing.load(Ordering::Relaxed));
+    state.fill(&mut output, 2);
+    assert!(output.iter().all(|sample| *sample == 0.0));
+}
+
+#[test]
+fn sinc_callback_speed_changes_allocate_nothing_after_warmup() {
+    use soundcraft_model::ChannelFormat;
+    let mut state = audio_output_state(ChannelFormat::Stereo, vec![vec![0.25; 48_000]; 2]);
+    state.device_rate = 44_100.0;
+    let mut output = [0.0; 2 * 1024];
+    state.fill(&mut output, 2);
+    state.fill(&mut output, 2);
+    let shared = Arc::clone(&state.shared);
+    let _meters = shared.meters.lock().unwrap();
+    let allocations = allocation_counter::measure(|| {
+        for speed in [100, 1000, 4000, 500, 1000] {
+            state.shared.speed.store(speed, Ordering::Relaxed);
+            for frames in [1, 7, 64, 512, 1024] {
+                state.fill(&mut output[..2 * frames], 2);
+            }
+        }
+    });
+    assert_eq!(allocations.count_total, 0, "{allocations:?}");
+}
+
+#[test]
+fn playback_callback_rejects_rate_conversion_images() {
+    use soundcraft_model::ChannelFormat;
+    let source: Vec<_> = (0..12_000).map(|frame| (std::f64::consts::TAU * 1000.0 * frame as f64 / 48_000.0).sin() as f32 * 0.5).collect();
+    let mut state = audio_output_state(ChannelFormat::Stereo, vec![source.clone(), source]);
+    state.device_rate = 44_100.0;
+    let mut output = vec![0.0; 2 * 6000];
+    state.fill(&mut output, 2);
+    let amplitude = |frequency: f64| {
+        let (mut real, mut imaginary) = (0.0, 0.0);
+        for (frame, sample) in output.as_chunks::<2>().0.iter().skip(1000).take(4410).enumerate() {
+            let angle = std::f64::consts::TAU * frequency * frame as f64 / 44_100.0;
+            real += f64::from(sample[0]) * angle.cos();
+            imaginary += f64::from(sample[0]) * angle.sin();
+        }
+        real.hypot(imaginary)
+    };
+    let rejection = 20.0 * (amplitude(1000.0) / amplitude(2900.0).max(amplitude(4900.0))).log10();
+    println!("Playback callback: {rejection:.2} dB image rejection");
+    assert!(rejection > 60.0, "{rejection}");
 }
 
 #[test]

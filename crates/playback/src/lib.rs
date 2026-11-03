@@ -12,6 +12,12 @@
 //! the device has fewer channels than the main mix, surround is folded down to stereo (ITU-R
 //! BS.775). A mono device receives the average of the stereo channels, before output clipping.
 //!
+//! Rate conversion and varispeed use rubato's windowed-sinc phase tables, with 128 source
+//! frames of group delay and preallocated cutoff banks selected at callback boundaries.
+//! Transport positions count source frames, not delayed device frames. Natural playback ends
+//! flush the filter tail without advancing transport; Stop and Locate discard it. Equal rates
+//! at normal speed bypass the filter with no added latency.
+//!
 //! Plugins and threads: hosted third-party plugins (CLAP/VST3) are created, given their stored
 //! state and prepared on the thread that calls [`Player::update_session`] (the UI thread), and
 //! travel to the audio thread together with the session snapshot that needs them; the mix
@@ -46,6 +52,7 @@ const OLD_SESSIONS: usize = 16;
 pub use soundcraft_mix::{mark_audio_thread, on_audio_thread};
 
 mod callback;
+mod resample;
 mod stream;
 
 use callback::{AudioState, Fault, Side, take_meter_snapshot};
