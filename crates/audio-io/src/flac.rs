@@ -1,13 +1,27 @@
-//! A small pure-Rust FLAC encoder (RFC 9639): fixed blocksize, independent channels, and per
-//! subframe the cheapest of CONSTANT, VERBATIM or FIXED (orders 0–4) prediction with
-//! partitioned Rice-coded residuals. Decoding is symphonia's, after [`check_metadata`].
+//! Pure-Rust FLAC encoding (RFC 9639), with adaptive stereo and CONSTANT, VERBATIM,
+//! FIXED and LPC subframes. The default effort follows level 5: LPC orders 1–8,
+//! 15-bit coefficients, and Rice partition orders 0–5. Decoding is symphonia's.
+
+mod lpc;
+mod md5;
 
 use crate::pcm::{Quantizer, be_u32, le_u32, validate_buffer};
 use crate::{AudioBuffer, AudioError, AudioInfo, BitDepth, FileFormat, Result, SampleFormat};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
 const BLOCK_SIZE: usize = 4096;
-const MAX_PARTITION_ORDER: u32 = 6;
+#[derive(Clone, Copy)]
+struct Effort {
+    lpc_order: usize,
+    partition_order: u32,
+    stereo: bool,
+}
+
+impl Default for Effort {
+    fn default() -> Self {
+        Self { lpc_order: 8, partition_order: 5, stereo: true }
+    }
+}
 
 struct BitWriter {
     out: Vec<u8>,
@@ -149,7 +163,7 @@ fn fixed_residual(x: &[i64], order: usize) -> Option<Vec<i64>> {
             3 => g(0) - 3 * g(1) + 3 * g(2) - g(3),
             _ => g(0) - 4 * g(1) + 6 * g(2) - 4 * g(3) + g(4),
         };
-        if r < i64::from(i32::MIN) || r > i64::from(i32::MAX) {
+        if r < -i64::from(i32::MAX) || r > i64::from(i32::MAX) {
             return None;
         }
         res.push(r);
@@ -183,16 +197,18 @@ struct RicePlan {
     wide: bool,
 }
 
-fn plan_residual(u: &[u64], block_len: usize, pred_order: usize) -> RicePlan {
+fn plan_residual(u: &[u64], block_len: usize, pred_order: usize, max_partition_order: u32) -> RicePlan {
     let mut best: Option<RicePlan> = None;
-    for p in 0..=MAX_PARTITION_ORDER {
+    for p in 0..=max_partition_order.min(5) {
         let parts = 1usize << p;
         if !block_len.is_multiple_of(parts) || block_len / parts <= pred_order {
             break;
         }
         let per = block_len / parts;
         let mut params = Vec::with_capacity(parts);
+        let mut narrow_params = Vec::with_capacity(parts);
         let mut bits = 0u64;
+        let mut narrow_bits = 0u64;
         let mut start = 0usize;
         for i in 0..parts {
             let len = if i == 0 { per - pred_order } else { per };
@@ -201,9 +217,16 @@ fn plan_residual(u: &[u64], block_len: usize, pred_order: usize) -> RicePlan {
             let (k, cost) = best_rice(part);
             params.push(k);
             bits += cost;
+            narrow_params.push(k.min(14));
+            narrow_bits += if k <= 14 { cost } else { part.len() as u64 * 15 + part.iter().map(|value| value >> 14).sum::<u64>() };
         }
-        let wide = params.iter().any(|&k| k > 14);
-        bits += 6 + parts as u64 * if wide { 5 } else { 4 };
+        bits += 6 + parts as u64 * 5;
+        narrow_bits += 6 + parts as u64 * 4;
+        let wide = bits < narrow_bits;
+        if !wide {
+            bits = narrow_bits;
+            params = narrow_params;
+        }
         if best.as_ref().is_none_or(|b| bits < b.bits) {
             best = Some(RicePlan { order: p, params, bits, wide });
         }
@@ -228,46 +251,141 @@ fn write_residual(w: &mut BitWriter, u: &[u64], block_len: usize, pred_order: us
     }
 }
 
-fn write_subframe(w: &mut BitWriter, x: &[i64], bps: u32) {
-    let n = x.len();
-    let first = x.first().copied().unwrap_or(0);
-    if x.iter().all(|&s| s == first) {
-        w.write(0, 1);
-        w.write(0, 6);
-        w.write(0, 1);
-        w.write_signed(first, bps);
-        return;
+enum Prediction {
+    Constant,
+    Verbatim,
+    Fixed(usize),
+    Lpc { coefficients: Vec<i32>, shift: u32 },
+}
+
+struct Subframe {
+    prediction: Prediction,
+    residual: Vec<u64>,
+    rice: Option<RicePlan>,
+    bits: u64,
+}
+
+fn choose_subframe(samples: &[i64], bps: u32, effort: Effort) -> Subframe {
+    let first = samples.first().copied().unwrap_or(0);
+    if samples.iter().all(|&sample| sample == first) {
+        return Subframe { prediction: Prediction::Constant, residual: Vec::new(), rice: None, bits: 8 + u64::from(bps) };
     }
-    let verbatim_bits = n as u64 * u64::from(bps);
-    let mut best: Option<(usize, Vec<u64>, RicePlan)> = None;
-    for order in 0..=4usize.min(n.saturating_sub(1)) {
-        let Some(res) = fixed_residual(x, order) else { continue };
-        let u: Vec<u64> = res.into_iter().map(zigzag).collect();
-        let plan = plan_residual(&u, n, order);
-        let bits = plan.bits.saturating_add(order as u64 * u64::from(bps));
-        if bits < verbatim_bits && best.as_ref().is_none_or(|b| bits < b.2.bits.saturating_add(b.0 as u64 * u64::from(bps))) {
-            best = Some((order, u, plan));
+    let mut best = Subframe { prediction: Prediction::Verbatim, residual: Vec::new(), rice: None, bits: 8 + samples.len() as u64 * u64::from(bps) };
+    let mut consider = |prediction, residual: Vec<i64>, order: usize, overhead: u64| {
+        let folded: Vec<u64> = residual.into_iter().map(zigzag).collect();
+        let rice = plan_residual(&folded, samples.len(), order, effort.partition_order);
+        let bits = rice.bits.saturating_add(8 + order as u64 * u64::from(bps) + overhead);
+        if bits < best.bits {
+            best = Subframe { prediction, residual: folded, rice: Some(rice), bits };
+        }
+    };
+    for order in 0..=4usize.min(samples.len().saturating_sub(1)) {
+        if let Some(residual) = fixed_residual(samples, order) {
+            consider(Prediction::Fixed(order), residual, order, 0);
         }
     }
-    match best {
-        Some((order, u, plan)) => {
-            w.write(0, 1);
-            w.write(8 + order as u64, 6);
-            w.write(0, 1);
-            for &s in x.iter().take(order) {
-                w.write_signed(s, bps);
+    for coefficients in lpc::orders(samples, effort.lpc_order) {
+        let Some((coefficients, shift)) = lpc::quantise(&coefficients) else { continue };
+        let Some(residual) = lpc::residual(samples, &coefficients, shift) else { continue };
+        let order = coefficients.len();
+        consider(Prediction::Lpc { coefficients, shift }, residual, order, 9 + order as u64 * u64::from(lpc::PRECISION));
+    }
+    best
+}
+
+fn write_subframe(writer: &mut BitWriter, samples: &[i64], bps: u32, plan: &Subframe) {
+    let (kind, order) = match &plan.prediction {
+        Prediction::Constant => (0, 0),
+        Prediction::Verbatim => (1, 0),
+        Prediction::Fixed(order) => (8 + *order as u64, *order),
+        Prediction::Lpc { coefficients, .. } => (31 + coefficients.len() as u64, coefficients.len()),
+    };
+    writer.write(kind << 1, 8);
+    match &plan.prediction {
+        Prediction::Constant => writer.write_signed(samples.first().copied().unwrap_or(0), bps),
+        Prediction::Verbatim => {
+            for &sample in samples {
+                writer.write_signed(sample, bps);
             }
-            write_residual(w, &u, n, order, &plan);
         }
-        None => {
-            w.write(0, 1);
-            w.write(1, 6);
-            w.write(0, 1);
-            for &s in x {
-                w.write_signed(s, bps);
+        _ => {
+            for &sample in samples.iter().take(order) {
+                writer.write_signed(sample, bps);
+            }
+            if let Prediction::Lpc { coefficients, shift } = &plan.prediction {
+                writer.write(u64::from(lpc::PRECISION - 1), 4);
+                writer.write(u64::from(*shift), 5);
+                for &coefficient in coefficients {
+                    writer.write_signed(i64::from(coefficient), lpc::PRECISION);
+                }
+            }
+            if let Some(rice) = &plan.rice {
+                write_residual(writer, &plan.residual, samples.len(), order, rice);
             }
         }
     }
+}
+
+fn encode_frame(channels: &[Vec<i64>], sample_rate: u32, bps: u32, frame_number: u64, effort: Effort) -> Vec<u8> {
+    let side;
+    let mid;
+    let mut assignment = channels.len() as u64 - 1;
+    let mut plans: Vec<(&[i64], Subframe, u32)> = Vec::with_capacity(channels.len());
+    match channels {
+        [left, right] if effort.stereo && bps < 32 => {
+            side = left.iter().zip(right).map(|(&left, &right)| left - right).collect::<Vec<_>>();
+            mid = left.iter().zip(right).map(|(&left, &right)| (left + right) >> 1).collect::<Vec<_>>();
+            let left_plan = choose_subframe(left, bps, effort);
+            let right_plan = choose_subframe(right, bps, effort);
+            let side_plan = choose_subframe(&side, bps + 1, effort);
+            let mid_plan = choose_subframe(&mid, bps, effort);
+            let options = [
+                (1, left_plan.bits + right_plan.bits),
+                (8, left_plan.bits + side_plan.bits),
+                (9, side_plan.bits + right_plan.bits),
+                (10, mid_plan.bits + side_plan.bits),
+            ];
+            assignment = options.into_iter().min_by_key(|&(_, bits)| bits).map_or(1, |(code, _)| code);
+            match assignment {
+                8 => plans.extend([(left.as_slice(), left_plan, bps), (&side, side_plan, bps + 1)]),
+                9 => plans.extend([(side.as_slice(), side_plan, bps + 1), (right, right_plan, bps)]),
+                10 => plans.extend([(mid.as_slice(), mid_plan, bps), (&side, side_plan, bps + 1)]),
+                _ => plans.extend([(left.as_slice(), left_plan, bps), (right, right_plan, bps)]),
+            }
+        }
+        _ => {
+            for channel in channels {
+                plans.push((channel, choose_subframe(channel, bps, effort), bps));
+            }
+        }
+    }
+    let length = channels.first().map_or(0, Vec::len);
+    let (rate_code, rate_extra) = sample_rate_code(sample_rate);
+    let mut writer = BitWriter::new();
+    writer.write(0x3FFE, 14);
+    writer.write(0, 2);
+    writer.write(7, 4);
+    writer.write(rate_code, 4);
+    writer.write(assignment, 4);
+    writer.write(bps_code(bps), 3);
+    writer.write(0, 1);
+    write_utf8_number(&mut writer, frame_number);
+    writer.write(length.saturating_sub(1) as u64, 16);
+    if let Some((value, bits)) = rate_extra {
+        writer.write(value, bits);
+    }
+    let header = writer.into_bytes();
+    let mut writer = BitWriter::new();
+    for &byte in &header {
+        writer.write(u64::from(byte), 8);
+    }
+    writer.write(u64::from(crc8(&header)), 8);
+    for (samples, plan, depth) in plans {
+        write_subframe(&mut writer, samples, depth, &plan);
+    }
+    let mut frame = writer.into_bytes();
+    frame.extend_from_slice(&crc16(&frame).to_be_bytes());
+    frame
 }
 
 /// Checks that FLAC can hold the layout; returns the bits per sample.
@@ -318,6 +436,8 @@ pub(crate) struct Writer<W> {
     pending: Vec<Vec<i64>>,
     frames: u64,
     frame_no: u64,
+    effort: Effort,
+    md5: md5::Md5,
     /// Set when a frame write has failed: `write_frame` clears the pending samples before
     /// writing, so a failed frame is lost while `frames` still counts it; the writer refuses
     /// every later call.
@@ -340,6 +460,8 @@ impl<W: Write + Seek> Writer<W> {
             pending: (0..channels).map(|_| Vec::with_capacity(BLOCK_SIZE)).collect(),
             frames: 0,
             frame_no: 0,
+            effort: Effort::default(),
+            md5: md5::Md5::default(),
             failed: false,
         })
     }
@@ -385,34 +507,19 @@ impl<W: Write + Seek> Writer<W> {
         if len == 0 {
             return Ok(());
         }
-        let (sr_code, sr_extra) = sample_rate_code(self.sample_rate);
-        let mut w = BitWriter::new();
-        w.write(0x3FFE, 14);
-        w.write(0, 1);
-        w.write(0, 1); // fixed blocksize stream
-        w.write(7, 4); // 16-bit (blocksize-1) follows
-        w.write(sr_code, 4);
-        w.write(self.channels as u64 - 1, 4);
-        w.write(bps_code(self.bps), 3);
-        w.write(0, 1);
-        write_utf8_number(&mut w, self.frame_no);
-        w.write(len as u64 - 1, 16);
-        if let Some((v, n)) = sr_extra {
-            w.write(v, n);
+        let bytes_per_sample = self.bps.div_ceil(8) as usize;
+        let mut pcm = Vec::with_capacity(len * self.channels * bytes_per_sample);
+        for index in 0..len {
+            for channel in &self.pending {
+                let bytes = channel.get(index).copied().unwrap_or(0).to_le_bytes();
+                pcm.extend_from_slice(bytes.get(..bytes_per_sample).unwrap_or_default());
+            }
         }
-        let header = w.into_bytes();
-        let mut w = BitWriter::new();
-        for &b in &header {
-            w.write(u64::from(b), 8);
+        self.md5.update(&pcm);
+        let frame = encode_frame(&self.pending, self.sample_rate, self.bps, self.frame_no, self.effort);
+        for channel in &mut self.pending {
+            channel.clear();
         }
-        w.write(u64::from(crc8(&header)), 8);
-        for p in &mut self.pending {
-            write_subframe(&mut w, p, self.bps);
-            p.clear();
-        }
-        let mut frame = w.into_bytes();
-        let crc = crc16(&frame);
-        frame.extend_from_slice(&crc.to_be_bytes());
         self.out.write_all(&frame)?;
         self.frame_no += 1;
         Ok(())
@@ -423,7 +530,10 @@ impl<W: Write + Seek> Writer<W> {
             return Err(crate::failed_write_error());
         }
         self.write_frame()?;
-        let info = stream_info(self.channels, self.sample_rate, self.bps, self.frames);
+        let mut info = stream_info(self.channels, self.sample_rate, self.bps, self.frames);
+        if let Some(signature) = info.get_mut(22..38) {
+            signature.copy_from_slice(&self.md5.digest());
+        }
         self.out.seek(SeekFrom::Start(self.start.saturating_add(4)))?;
         self.out.write_all(&info)?;
         self.out.seek(SeekFrom::End(0))?;
@@ -561,3 +671,6 @@ mod tests {
         assert_eq!(enc(0x800), vec![0xE0, 0xA0, 0x80]);
     }
 }
+
+#[cfg(test)]
+mod lpc_tests;
