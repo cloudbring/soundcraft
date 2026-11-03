@@ -82,13 +82,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "#48: craft-h264 slice.rs needs checked slice QP addition; panics at 935b3523"]
     fn huge_slice_qp_delta_is_invalid() {
         assert!(matches!(parse_override(0, 0, 0, i32::MAX), Err(soundcraft_video::h264::Error::Invalid(_))));
     }
 
     #[test]
-    #[ignore = "#48: craft-h264 slice.rs needs saturating POC arithmetic; panics at 935b3523"]
     fn poc0_huge_bottom_delta_does_not_overflow() {
         let (mut sps, _) = sps_pps();
         sps.pic_order_cnt_type = 0;

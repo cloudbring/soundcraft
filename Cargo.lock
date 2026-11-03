@@ -1064,9 +1064,9 @@ dependencies = [
 [[package]]
 name = "craft-bitstream"
 version = "0.1.0"
-source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-craft-h264#935b3523ef56b00f97ff6bba4b989108e3a51a33"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-h264-deckcraft-fixes#e0f337e00e78309183d6bdfb92d1229ebaefe36e"
 dependencies = [
- "craft-media 0.1.0 (git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-craft-h264)",
+ "craft-media 0.1.0 (git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-h264-deckcraft-fixes)",
 ]
 
 [[package]]
@@ -1082,7 +1082,7 @@ source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955
 [[package]]
 name = "craft-h264"
 version = "0.1.0"
-source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-craft-h264#935b3523ef56b00f97ff6bba4b989108e3a51a33"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-h264-deckcraft-fixes#e0f337e00e78309183d6bdfb92d1229ebaefe36e"
 dependencies = [
  "craft-bitstream",
  "rayon",
@@ -1115,7 +1115,7 @@ dependencies = [
 [[package]]
 name = "craft-media"
 version = "0.1.0"
-source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-craft-h264#935b3523ef56b00f97ff6bba4b989108e3a51a33"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2F48-h264-deckcraft-fixes#e0f337e00e78309183d6bdfb92d1229ebaefe36e"
 dependencies = [
  "thiserror 2.0.21",
 ]

@@ -8,11 +8,12 @@ All are replaced by shared-crate re-exports; `Movie` directly uses shared `Decod
 The public `soundcraft_video::{h264,bitstream}` paths remain available. H.264 threading
 stays off by default and follows the existing video `threads` feature.
 
-**Valid-stream fixture parity is verified; malformed-input safety parity is not complete.**
-Eight SoundCraft-only hardening groups in five files still need upstreaming. Two retained
-regression tests are explicitly ignored until the upstream overflow fixes land; running
-them with `--ignored` reproduces the failures. Do not treat the ordinary green suite as
-proof that all former decoder hardening survived extraction.
+**Step 5 update:** Both shared codec crates now resolve to
+`cloudbring/craft-libs` `algo/48-h264-deckcraft-fixes` at `e0f337e0`. All eight
+SoundCraft-only hardening groups listed below were upstreamed with regression tests.
+The two retained overflow regressions are enabled and pass (see Step 5 validation).
+The file classifications and failure probes below document the original migration
+against `935b3523`, not the current shared decoder.
 
 ## File by file classification
 
@@ -111,13 +112,11 @@ third still rejects oversized reference counts, but now reports
 `Error::Bitstream(BitError::InvalidExpGolomb)` instead of `Error::Invalid`; its retained
 assertion is updated to the shared error variant, not weakened to accept a panic.
 
-The two real overflow regressions are retained as explicitly ignored tests in
-`tests/upstream_regressions.rs`; run
-`cargo test -p soundcraft-video --test upstream_regressions -- --ignored`
-to reproduce. They are blockers to claiming full malformed-input parity, not
-valid-stream fixture changes. No upstream fixes are applied by this migration.
+At the original migration revision, the two real overflow regressions were kept
+ignored in `tests/upstream_regressions.rs`. They are now enabled against the hardened
+shared decoder and pass without `--ignored`.
 
-## Final validation
+## Original migration validation (against `935b3523`)
 
 Using rustup stable (rustc 1.99.0), with FFmpeg available during fixture tests:
 
@@ -134,3 +133,14 @@ Using rustup stable (rustc 1.99.0), with FFmpeg available during fixture tests:
 
 Build output, downloaded tooling and generated parity snapshots used the isolated
 `target-48` directory and are removed after validation; no fixture binaries are committed.
+
+## Step 5 validation (against `e0f337e0`)
+
+- `cargo test -p soundcraft-video --test upstream_regressions`: 3 passed, 0 failed,
+  0 ignored, including both formerly ignored overflow regressions.
+- `cargo test -p soundcraft-video`: 28 passed, 0 failed, 0 ignored; doctests 0.
+- `cargo clippy -p soundcraft-video --all-targets -- -D warnings` and
+  `cargo fmt --all -- --check`: passed.
+- `cargo xtask ci` using rustup stable (including WASM): 7/7 gates passed;
+  1,615 tests passed, 0 failed, 0 ignored. Homebrew Rust cannot run the WASM
+  gate because its sysroot lacks `wasm32-unknown-unknown`.

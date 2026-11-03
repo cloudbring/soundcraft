@@ -16,8 +16,8 @@ threads = ["dep:rayon", "craft-h264/threads"]
 [dependencies]
 craft-media.workspace = true
 # TODO(#48): repoint to storytold/craft-libs once craft-h264 merges
-craft-h264 = { git = "https://github.com/cloudbring/craft-libs", branch = "algo/48-craft-h264", default-features = false }
-craft-bitstream = { git = "https://github.com/cloudbring/craft-libs", branch = "algo/48-craft-h264" }
+craft-h264 = { git = "https://github.com/cloudbring/craft-libs", branch = "algo/48-h264-deckcraft-fixes", default-features = false }
+craft-bitstream = { git = "https://github.com/cloudbring/craft-libs", branch = "algo/48-h264-deckcraft-fixes" }
 thiserror.workspace = true
 serde.workspace = true
 image = { workspace = true, features = ["jpeg"] }
