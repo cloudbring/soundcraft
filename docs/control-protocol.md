@@ -12,6 +12,21 @@ input), and every command is reachable from:
 | MCP (headless) | `soundcraft-cli mcp [--demo]` |
 | MCP (bridged to the app) | `soundcraft-cli mcp --connect <port>` |
 
+## Authentication
+
+Every control-server launch generates a fresh 256-bit token. By default it is printed to stderr;
+alternatively set `SOUNDCRAFT_CONTROL_TOKEN_FILE` to a nonexistent path before launch. The server
+creates it without overwriting existing files (mode 0600 on Unix); remove it after use. Failure to
+generate or save the token prevents the server from starting. Protect stderr and the token file.
+On non-Unix systems restrict access to the file using platform permissions.
+
+Set `SOUNDCRAFT_CONTROL_TOKEN` to the token or `SOUNDCRAFT_CONTROL_TOKEN_FILE` to its path for
+`soundcraft-cli app` and bridged MCP; do not set both. Headless CLI and MCP do not require a token.
+Each raw TCP connection must first send `{"id":0,"method":"auth","params":{"token":"<token>"}}`
+and receive `{"id":0,"ok":true,"result":{"authenticated":true}}`. An incorrect or absent token
+closes the connection before any command is dispatched. Authentication is limited to 1024 bytes
+and ten seconds, with a delay on failures.
+
 ## Isolated automation profiles
 
 Set `SOUNDCRAFT_CONFIG_DIR` to a fresh directory to isolate UI preferences, `Autosave`, `Presets`, and `logs`.
@@ -71,7 +86,9 @@ Scripted input (`ui.click`, `ui.drag`, `ui.scroll`, `ui.zoom`, `ui.key`, `ui.tex
 ## Examples
 
 ```sh
-P=$(soundcraft --demo --control 0 | sed -n 's/SOUNDCRAFT_CONTROL_PORT=//p')   # or read stderr
+export SOUNDCRAFT_CONTROL_TOKEN_FILE=/tmp/soundcraft-token-unique
+soundcraft --demo --control 7801 &
+P=7801 # Wait for the token file to appear before connecting.
 soundcraft-cli app --port $P mix.solo '{"track":"Bass"}'
 soundcraft-cli app --port $P transport.play
 soundcraft-cli app --port $P ui.screenshot '{"path":"/tmp/shot.png"}'

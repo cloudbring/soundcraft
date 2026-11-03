@@ -20,6 +20,7 @@ pub(crate) const RUST_LOG: &str = "RUST_LOG";
 pub(crate) const VARS: &[(&str, &str)] = &[
     // Read by clap (`env =` on `--control`), not by `Env`.
     ("SOUNDCRAFT_CONTROL_PORT", "The --control fallback: a port or host:port, ignored for another host"),
+    ("SOUNDCRAFT_CONTROL_TOKEN_FILE", "Create a new private file containing the per-launch control token"),
     (CONFIG_DIR, "The settings folder (ui.json, Autosave, Presets, logs); empty: none (unlike the others, where empty counts as unset)"),
     (NO_PREFS, "1 doesn't read or write preferences and logs to stderr only; 0 or unset is off"),
     (NO_SYSTEM_FONTS, "1 uses the built-in fonts only; 0 or unset is off"),

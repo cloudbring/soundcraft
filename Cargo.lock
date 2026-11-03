@@ -4346,11 +4346,13 @@ name = "soundcraft-automation"
 version = "0.17.0"
 dependencies = [
  "clap",
+ "getrandom 0.3.4",
  "log",
  "serde_json",
  "soundcraft-audio-io",
  "soundcraft-engine",
  "soundcraft-time",
+ "subtle",
  "thiserror 2.0.21",
 ]
 

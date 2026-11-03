@@ -1,5 +1,9 @@
 # MCP server
 
+When connecting to the desktop control server, set `SOUNDCRAFT_CONTROL_TOKEN_FILE` to the
+private token file created at launch, or set `SOUNDCRAFT_CONTROL_TOKEN` to the token printed
+on stderr. Set only one. Headless MCP does not need a token; see `control-protocol.md`.
+
 SoundCraft speaks the [Model Context Protocol](https://modelcontextprotocol.io) over stdio, so
 Claude and other agents can make music with it. The server is the `mcp` subcommand of
 `soundcraft-cli`, which [docs/cli.md](cli.md) describes.

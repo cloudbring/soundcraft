@@ -216,6 +216,8 @@ soundcraft-cli run --demo \
 
 # Drive the running app.
 soundcraft --demo --control 7801 &
+# Start the app with SOUNDCRAFT_CONTROL_TOKEN_FILE set to a new private path;
+# export the same variable for the CLI (or set SOUNDCRAFT_CONTROL_TOKEN from stderr).
 soundcraft-cli app --port 7801 transport.play
 soundcraft-cli app --port 7801 ui.screenshot '{"path":"shot.png"}'
 

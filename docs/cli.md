@@ -21,6 +21,9 @@ flags, values and defaults. This page does not repeat them.
 | `parity` | Prints the parity report as markdown |
 | `plugins` | Lists the built-in plugins |
 
+For `app` and `mcp --connect`, provide the desktop server's per-launch token via
+`SOUNDCRAFT_CONTROL_TOKEN` or `SOUNDCRAFT_CONTROL_TOKEN_FILE`; see the control protocol.
+
 ```sh
 soundcraft-cli --version                 # also -V; there is no `version` subcommand
 soundcraft-cli help convert              # the same as `convert --help`

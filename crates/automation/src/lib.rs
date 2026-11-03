@@ -12,6 +12,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod args;
 pub mod mcp;
+pub mod security;
 
 use serde_json::{Value, json};
 use soundcraft_engine::Engine;
@@ -157,19 +158,43 @@ pub struct Remote {
     addr: String,
     conn: Option<Connection>,
     next_id: u64,
+    #[cfg(test)]
+    token: Option<String>,
 }
 
 impl Remote {
     /// A client for the app at `target`; it connects on the first request.
     pub fn new(target: &ControlTarget) -> Self {
-        Remote { addr: target.to_string(), conn: None, next_id: 1 }
+        Remote {
+            addr: target.to_string(),
+            conn: None,
+            next_id: 1,
+            #[cfg(test)]
+            token: None,
+        }
     }
 
     /// The open connection, connecting first when there is none.
     fn connection(&mut self) -> Result<&mut Connection, RemoteError> {
         match self.conn {
             Some(ref mut conn) => Ok(conn),
-            None => Ok(self.conn.insert(connect(&self.addr)?)),
+            None => {
+                let mut conn = connect(&self.addr)?;
+                #[cfg(test)]
+                let token = self.token.clone().map_or_else(security::client_token, Ok)?;
+                #[cfg(not(test))]
+                let token = security::client_token()?;
+                writeln!(conn.0, "{}", json!({"id":0,"method":"auth","params":{"token":token}}))?;
+                let mut line = String::new();
+                conn.1.read_line(&mut line)?;
+                let response: Value = serde_json::from_str(&line)?;
+                if response.get("ok").and_then(Value::as_bool) != Some(true)
+                    || response.pointer("/result/authenticated").and_then(Value::as_bool) != Some(true)
+                {
+                    return Err(RemoteError::App("control authentication failed".into()));
+                }
+                Ok(self.conn.insert(conn))
+            }
         }
     }
 
@@ -275,8 +300,22 @@ mod tests {
     fn remote_resolves_hostnames() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let mut r = Remote::new(&ControlTarget { host: Some("localhost".into()), port });
-        assert!(r.connection().is_ok());
+        assert!(connect(&format!("localhost:{port}")).is_ok());
+    }
+
+    fn test_remote(addr: &ControlTarget) -> Remote {
+        let mut remote = Remote::new(addr);
+        remote.token = Some("a".repeat(64));
+        remote
+    }
+
+    fn authenticate_fake(sock: &mut TcpStream, reader: &mut BufReader<TcpStream>) {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "auth");
+        assert_eq!(request["params"]["token"], "a".repeat(64));
+        writeln!(sock, "{}", json!({"id":0,"ok":true,"result":{"authenticated":true}})).unwrap();
     }
 
     /// Fake app: accepts one connection per entry in `replies`, counts the request line it reads,
@@ -289,8 +328,10 @@ mod tests {
         std::thread::spawn(move || {
             for answer in replies {
                 let Ok((mut sock, _)) = listener.accept() else { return };
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                authenticate_fake(&mut sock, &mut reader);
                 let mut line = String::new();
-                if BufReader::new(sock.try_clone().unwrap()).read_line(&mut line).unwrap_or(0) > 0 {
+                if reader.read_line(&mut line).unwrap_or(0) > 0 {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if answer {
                         let _ = writeln!(sock, "{}", json!({"id": 1, "ok": true, "result": {"done": true}}));
@@ -304,7 +345,7 @@ mod tests {
     #[test]
     fn remote_does_not_repeat_a_mutation_after_a_lost_reply() {
         let (addr, seen) = fake_app(vec![false, true]);
-        let mut r = Remote::new(&addr);
+        let mut r = test_remote(&addr);
         let err = r.call("engine.execute", json!({"command": "track.new"})).unwrap_err();
         assert!(err.contains("may or may not have been executed"), "{err}");
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -313,7 +354,7 @@ mod tests {
     #[test]
     fn remote_retries_a_read_after_a_lost_reply() {
         let (addr, seen) = fake_app(vec![false, true]);
-        let mut r = Remote::new(&addr);
+        let mut r = test_remote(&addr);
         assert!(r.call("session.inspect", json!({})).is_ok());
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
@@ -324,11 +365,13 @@ mod tests {
         let addr = ControlTarget { host: None, port: listener.local_addr().unwrap().port() };
         std::thread::spawn(move || {
             let Ok((mut sock, _)) = listener.accept() else { return };
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            authenticate_fake(&mut sock, &mut reader);
             let mut line = String::new();
-            let _ = BufReader::new(sock.try_clone().unwrap()).read_line(&mut line);
+            let _ = reader.read_line(&mut line);
             let _ = writeln!(sock, "{}", json!({"id": 1, "ok": false, "error": "transport.locate: nothing to reset"}));
         });
-        let mut r = Remote::new(&addr);
+        let mut r = test_remote(&addr);
         let err = r.call("engine.execute", json!({"command": "transport.locate"})).unwrap_err();
         assert_eq!(err, "transport.locate: nothing to reset");
     }

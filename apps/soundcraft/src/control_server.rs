@@ -39,9 +39,25 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     let actual = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let token = match soundcraft_automation::security::generate_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("soundcraft: control server cannot generate token: {error}");
+            return rx;
+        }
+    };
+    if let Some(path) = std::env::var_os("SOUNDCRAFT_CONTROL_TOKEN_FILE") {
+        if let Err(error) = soundcraft_automation::security::write_token(std::path::Path::new(&path), &token) {
+            eprintln!("soundcraft: control server cannot create token file: {error}");
+            return rx;
+        }
+        eprintln!("soundcraft: control token file: {}", std::path::Path::new(&path).display());
+    } else {
+        eprintln!("soundcraft: control token: {token}");
+    }
     log::info!("control server listening on 127.0.0.1:{actual}");
     println!("SOUNDCRAFT_CONTROL_PORT={actual}");
-    let spawned = std::thread::Builder::new().name("soundcraft-control".into()).spawn(move || accept_loop(listener, tx, ctx));
+    let spawned = std::thread::Builder::new().name("soundcraft-control".into()).spawn(move || accept_loop(listener, tx, ctx, token));
     if let Err(e) = spawned {
         log::error!("control thread failed: {e}");
     }
@@ -60,8 +76,9 @@ impl Drop for Slot {
 
 /// Accept until the listener closes, admitting at most [`MAX_CONNECTIONS`] peers; excess peers get one error line.
 /// Each admitted connection is served on its own thread, releasing its slot on exit.
-fn accept_loop(listener: TcpListener, tx: SyncSender<ControlRequest>, ctx: egui::Context) {
+fn accept_loop(listener: TcpListener, tx: SyncSender<ControlRequest>, ctx: egui::Context, token: String) {
     let open = Arc::new(AtomicUsize::new(0));
+    let token = Arc::new(token);
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             open.fetch_sub(1, Ordering::SeqCst);
@@ -71,9 +88,10 @@ fn accept_loop(listener: TcpListener, tx: SyncSender<ControlRequest>, ctx: egui:
         let slot = Slot(Arc::clone(&open));
         let tx = tx.clone();
         let ctx = ctx.clone();
+        let token = Arc::clone(&token);
         let _ = std::thread::Builder::new().name("soundcraft-control-conn".into()).spawn(move || {
             let _slot = slot;
-            serve(stream, tx, ctx);
+            serve(stream, tx, ctx, &token);
         });
     }
 }
@@ -104,7 +122,49 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 
 /// Answer newline-delimited JSON requests for one connection: bound each line, forward it to the UI thread with a 90
 /// s reply deadline, and stop at EOF, invalid UTF-8 or a closed request queue. Bad JSON still gets an error reply.
-fn serve(stream: TcpStream, tx: SyncSender<ControlRequest>, ctx: egui::Context) {
+fn authenticate(stream: &mut TcpStream, expected: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut line = Vec::new();
+    let mut complete = false;
+    while line.len() < 1024 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return false;
+        }
+        let mut byte = [0];
+        if stream.read_exact(&mut byte).is_err() {
+            return false;
+        }
+        if byte[0] == b'\n' {
+            complete = true;
+            break;
+        }
+        line.push(byte[0]);
+    }
+    let request: Value = serde_json::from_slice(&line).unwrap_or(Value::Null);
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let supplied = request.pointer("/params/token").and_then(Value::as_str).unwrap_or("");
+    let valid = complete
+        && request.get("method").and_then(Value::as_str) == Some("auth")
+        && soundcraft_automation::security::token_matches(expected, supplied);
+    if !valid {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let response = if valid {
+        json!({"id":id,"ok":true,"result":{"authenticated":true}})
+    } else {
+        json!({"id":id,"ok":false,"error":"authentication required"})
+    };
+    writeln!(stream, "{response}").is_ok() && valid
+}
+
+fn serve(mut stream: TcpStream, tx: SyncSender<ControlRequest>, ctx: egui::Context, token: &str) {
+    if !authenticate(&mut stream, token) {
+        return;
+    }
+    if stream.set_read_timeout(None).is_err() {
+        return;
+    }
     let Ok(read) = stream.try_clone() else { return };
     let mut out = stream;
     let mut reader = BufReader::new(read);
@@ -155,6 +215,55 @@ fn serve(stream: TcpStream, tx: SyncSender<ControlRequest>, ctx: egui::Context) 
 mod tests {
     use super::*;
 
+    fn auth_exchange(first: Value, command: bool) -> (Value, bool) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = sync_channel(MAX_QUEUED_REQUESTS);
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve(stream, tx, egui::Context::default(), &"a".repeat(64));
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        writeln!(client, "{first}").unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let response = serde_json::from_str(&line).unwrap();
+        let called = if command {
+            writeln!(client, "{}", json!({"method":"engine.execute","params":{"command":"session.save"}})).unwrap();
+            let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(request);
+            true
+        } else {
+            false
+        };
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        worker.join().unwrap();
+        (response, called || rx.try_recv().is_ok())
+    }
+
+    #[test]
+    fn unauthenticated_command_never_dispatches() {
+        let (reply, called) = auth_exchange(json!({"method":"engine.execute","params":{"command":"session.save"}}), false);
+        assert_eq!(reply["ok"], false);
+        assert!(!called);
+    }
+
+    #[test]
+    fn wrong_token_is_rejected() {
+        let (reply, called) = auth_exchange(json!({"method":"auth","params":{"token":"b".repeat(64)}}), false);
+        assert_eq!(reply["ok"], false);
+        assert!(!called);
+    }
+
+    #[test]
+    fn correct_token_permits_dispatch() {
+        let (reply, called) = auth_exchange(json!({"method":"auth","params":{"token":"a".repeat(64)}}), true);
+        assert_eq!(reply["result"]["authenticated"], true);
+        assert!(called);
+    }
+
     #[test]
     fn lines_are_read_up_to_the_limit() {
         let mut buf = Vec::new();
@@ -190,7 +299,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = sync_channel::<ControlRequest>(MAX_QUEUED_REQUESTS);
-        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default()));
+        std::thread::spawn(move || accept_loop(listener, tx, egui::Context::default(), "a".repeat(64)));
         std::thread::spawn(move || {
             for req in rx {
                 let _ = req.reply.send(json!({"ok": true, "method": req.method}));
@@ -204,6 +313,10 @@ mod tests {
         let addr = serve_echo();
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(c, "{}", json!({"method":"auth","params":{"token":"a".repeat(64)}})).unwrap();
+        let mut response = String::new();
+        BufReader::new(c.try_clone().unwrap()).read_line(&mut response).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["ok"], true);
         c.write_all(b"{\"id\":3,\"method\":\"ping\"}\r\n\n{\"id\":4,\"method\":\"pong\"}\n").unwrap();
         let mut r = BufReader::new(c);
         for (id, method) in [(3, "ping"), (4, "pong")] {
