@@ -1,0 +1,9 @@
+[workspace]
+members = ["a"]
+
+[workspace.package]
+version = "0.2.0-rc.1"
+edition = "2024"
+
+[workspace.dependencies]
+foo = { version = "1" }

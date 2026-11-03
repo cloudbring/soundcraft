@@ -1072,6 +1072,14 @@ version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
 
 [[package]]
+name = "craft-hash"
+version = "0.1.0"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2Fintegration#4acbbe26f475c3ad98a44a654553a5711929d6d3"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "craft-i18n"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
@@ -1147,6 +1155,17 @@ dependencies = [
  "winreg",
  "winsafe",
  "zip",
+]
+
+[[package]]
+name = "craft-xtask"
+version = "0.1.0"
+source = "git+https://github.com/cloudbring/craft-libs?branch=algo%2Fintegration#4acbbe26f475c3ad98a44a654553a5711929d6d3"
+dependencies = [
+ "craft-hash",
+ "glob",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6191,6 +6210,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 name = "xtask"
 version = "0.17.0"
 dependencies = [
+ "craft-xtask",
  "serde_json",
 ]
 

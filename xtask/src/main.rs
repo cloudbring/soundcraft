@@ -1,11 +1,21 @@
-//! `cargo xtask <ci|test|layers|assets|parity|wasm>` — repository gates.
+//! `cargo xtask <ci|test|layers|assets|parity|wasm|version|ico>` — repository gates.
 
-mod ico;
-mod version;
+mod task_policy;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+
+const USAGE: &str = "usage: cargo xtask <ci|test|layers|assets|parity|wasm|version|ico>";
+
+fn usage() -> String {
+    format!(
+        "{USAGE}\n\nShared task syntax:\n  {}\n  {}\n  {}\n",
+        craft_xtask::version::cli_help(),
+        craft_xtask::ico::cli_help(),
+        craft_xtask::layers::cli_help(),
+    )
+}
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
@@ -18,70 +28,6 @@ fn cargo_bin() -> String {
 fn cargo(args: &[&str]) -> Result<(), String> {
     let st = Command::new(cargo_bin()).args(args).current_dir(root()).status().map_err(|e| e.to_string())?;
     if st.success() { Ok(()) } else { Err(format!("cargo {} failed", args.join(" "))) }
-}
-
-/// Layer table: crate name (minus `soundcraft-`) → layer. Apps and xtask are exempt.
-const LAYERS: &[(&str, u8)] = &[
-    ("time", 0),
-    ("audio-io", 0),
-    ("midi", 0),
-    ("video", 0),
-    ("dsp", 1),
-    ("clap-host", 1),
-    ("vst3-host", 1),
-    ("au-host", 1),
-    ("model", 2),
-    ("mix", 3),
-    ("engine", 4),
-    ("playback", 4),
-    ("automation", 5),
-    ("ui-egui", 6),
-];
-/// Standalone format crates: no workspace dependencies at all (publishable on their own).
-const STANDALONE: &[&str] = &["time", "audio-io", "midi", "video", "dsp"];
-const UI_CRATES: &[&str] = &["craft-ui", "egui", "eframe", "winit", "egui_kittest", "rfd", "egui-wgpu", "egui_glow"];
-const EXEMPT: &[&str] = &["soundcraft", "soundcraft-cli", "soundcraft-web", "xtask"];
-
-fn layers() -> Result<(), String> {
-    let out =
-        Command::new("cargo").args(["metadata", "--format-version", "1", "--no-deps"]).current_dir(root()).output().map_err(|e| e.to_string())?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
-    let mut problems = Vec::new();
-    for p in v["packages"].as_array().cloned().unwrap_or_default() {
-        let name = p["name"].as_str().unwrap_or("").to_string();
-        if EXEMPT.contains(&name.as_str()) {
-            continue;
-        }
-        let short = name.trim_start_matches("soundcraft-");
-        let Some(&(_, layer)) = LAYERS.iter().find(|(n, _)| *n == short) else {
-            problems.push(format!("{name}: not registered in xtask LAYERS"));
-            continue;
-        };
-        for d in p["dependencies"].as_array().cloned().unwrap_or_default() {
-            let dn = d["name"].as_str().unwrap_or("");
-            let kind = d["kind"].as_str().unwrap_or("normal");
-            if UI_CRATES.contains(&dn) && layer < 6 && kind != "dev" {
-                problems.push(format!("{name} (L{layer}) depends on UI crate {dn}"));
-            }
-            if let Some(ds) = dn.strip_prefix("soundcraft-") {
-                if STANDALONE.contains(&short) && kind != "dev" {
-                    problems.push(format!("{name} is standalone but depends on {dn}"));
-                }
-                if let Some(&(_, dl)) = LAYERS.iter().find(|(n, _)| *n == ds)
-                    && dl > layer
-                    && kind != "dev"
-                {
-                    problems.push(format!("{name} (L{layer}) depends upward on {dn} (L{dl})"));
-                }
-            }
-        }
-    }
-    if problems.is_empty() {
-        println!("layers: ok");
-        Ok(())
-    } else {
-        Err(problems.join("\n"))
-    }
 }
 
 const ASSET_EXT: &[&str] =
@@ -226,7 +172,7 @@ fn ci() -> Result<(), String> {
         ("test", Box::new(test)),
         ("doctest", Box::new(doctest)),
         ("assets", Box::new(assets)),
-        ("layers", Box::new(layers)),
+        ("layers", Box::new(|| craft_xtask::layers::run(&task_policy::configs(root()).layers, &[]))),
         ("wasm", Box::new(wasm)),
     ];
     let mut summary = Vec::new();
@@ -246,16 +192,22 @@ fn ci() -> Result<(), String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let shared_args = args.get(1..).unwrap_or(&[]);
+    let configs = task_policy::configs(root());
     let r = match args.first().map(String::as_str) {
         Some("ci") => ci(),
         Some("test") => test(),
-        Some("layers") => layers(),
+        Some("layers") => craft_xtask::layers::run(&configs.layers, shared_args),
         Some("assets") => assets(),
         Some("parity") => parity(),
         Some("wasm") => wasm(),
-        Some("version") => version::run(args.get(1..).unwrap_or(&[])),
-        Some("ico") => ico::run(args.get(1..).unwrap_or(&[])),
-        _ => Err("usage: cargo xtask <ci|test|layers|assets|parity|wasm|version>".into()),
+        Some("version") => craft_xtask::version::run(&configs.version, shared_args),
+        Some("ico") => craft_xtask::ico::run(&configs.ico, shared_args),
+        Some("-h" | "--help" | "help") => {
+            print!("{}", usage());
+            Ok(())
+        }
+        _ => Err(usage()),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,
