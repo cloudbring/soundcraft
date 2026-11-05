@@ -5,5 +5,7 @@ mod fuzz;
 mod offline_meters;
 mod offline_normalize;
 mod plugins;
+mod resample_equiv;
+mod resample_rejection;
 mod speed_ramp;
 mod transients;

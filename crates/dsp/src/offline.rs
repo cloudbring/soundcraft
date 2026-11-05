@@ -246,39 +246,38 @@ fn resample_ratio(ch: &[Vec<f32>], ratio: f64, out_len: usize) -> Vec<Vec<f32>> 
     ch.iter().map(|c| resample_channel(c, ratio, out_len, &table)).collect()
 }
 
-/// Most kernel weights a [`Polyphase`] bank may hold (16 MiB of f32).
+/// Most kernel weights a [`Bank`] may hold (16 MiB of f32).
 const MAX_POLYPHASE_WEIGHTS: usize = 1 << 22;
 
 /// The windowed-sinc kernel of [`resample_channel`] precomputed for every phase of a rational
-/// rate change `from` → `to` (reduced to `step` / `phases`). Output sample `n` reads input time
-/// `n * step / phases`: whole part `i`, phase `p`. Its taps are input samples `i + first ..`, one
-/// weight each, so every output is one dot product over contiguous memory instead of a table
-/// lookup and interpolation per tap. The weights are the ones `resample_channel` computes, taps
-/// beyond the kernel's half width weigh 0, and taps are summed in the same order.
-struct Polyphase {
-    phases: u64,
-    step: u64,
-    /// Offset of the first tap from `i`.
-    first: i64,
-    taps: usize,
-    /// `phases * taps` weights, phase-major.
-    weights: Vec<f32>,
+/// rate change `from` -> `to` (reduced to `step` / `phases`), run by `craft-resample`'s proved
+/// polyphase core (its Lean theorem: polyphase equals filter-then-decimate, no phase drift).
+///
+/// Output sample `n` reads input time `n * step / phases`: whole part `i`, phase `p`. Its taps are
+/// input samples `i + first ..`, one weight each. `craft-resample` taps reach backwards
+/// (`h[p + q*L] * x[i - q]`), so the prototype holds each phase's weights reversed, and the run
+/// starts `lead = first + taps - 1` input samples ahead (`Polyphase::process_from`). Taps outside
+/// the signal read as zero, so edges are clipped exactly as `resample_channel` does.
+struct Bank {
+    poly: craft_resample::Polyphase<f32>,
+    /// Upsampled index of output 0: `lead * phases`.
+    start: u128,
 }
 
-impl Polyphase {
+impl Bank {
     /// `None` when the bank would be too large (rates with no small common ratio); the caller
-    /// then falls back to [`resample_channel`].
-    fn new(from: u32, to: u32, table: &SincTable) -> Option<Polyphase> {
+    /// then uses the per-tap [`resample_channel`], which has no table to build.
+    fn new(from: u32, to: u32, table: &SincTable) -> Option<Bank> {
         let g = gcd(from, to);
-        let (step, phases) = (u64::from(from / g), u64::from(to / g));
+        let (step, phases) = (usize::try_from(from / g).ok()?, usize::try_from(to / g).ok()?);
         let hw = table.half_width;
         let first = (-hw).floor() as i64;
         let last = hw.ceil() as i64 + 1;
         let taps = usize::try_from(last - first + 1).ok()?;
-        if usize::try_from(phases).ok()?.checked_mul(taps)? > MAX_POLYPHASE_WEIGHTS {
+        if phases.checked_mul(taps)? > MAX_POLYPHASE_WEIGHTS {
             return None;
         }
-        let mut weights = Vec::with_capacity(taps * phases as usize);
+        let mut weights = Vec::with_capacity(taps * phases);
         for p in 0..phases {
             let frac = p as f64 / phases as f64;
             for k in first..first + taps as i64 {
@@ -286,29 +285,26 @@ impl Polyphase {
                 weights.push(if d.abs() <= hw { table.at(d) } else { 0.0 });
             }
         }
-        Some(Polyphase { phases, step, first, taps, weights })
+        Self::from_weights(phases, step, first, taps, &weights)
+    }
+
+    /// A bank from `phases * taps` phase-major weights, `weights[p * taps + k]` weighing input
+    /// `i + first + k` for output phase `p`.
+    fn from_weights(phases: usize, step: usize, first: i64, taps: usize, weights: &[f32]) -> Option<Bank> {
+        let lead = u128::try_from(first.checked_add(i64::try_from(taps).ok()?)?.checked_sub(1)?).ok()?;
+        let mut proto = vec![0.0f32; phases.checked_mul(taps)?];
+        for p in 0..phases {
+            for q in 0..taps {
+                let w = weights.get(p * taps + (taps - 1 - q)).copied()?;
+                *proto.get_mut(p + q * phases)? = w;
+            }
+        }
+        let poly = craft_resample::Polyphase::from_prototype(&proto, phases, step).ok()?;
+        Some(Bank { poly, start: lead.checked_mul(phases as u128)? })
     }
 
     fn run(&self, x: &[f32], out_len: usize) -> Vec<f32> {
-        let len = x.len() as i64;
-        let mut out = Vec::with_capacity(out_len);
-        for n in 0..out_len as u64 {
-            let Some(pos) = n.checked_mul(self.step) else { break };
-            let (i, p) = ((pos / self.phases) as i64, (pos % self.phases) as usize);
-            let w = self.weights.get(p * self.taps..(p + 1) * self.taps).unwrap_or_default();
-            let start = i + self.first;
-            let acc = match usize::try_from(start).ok().and_then(|s| x.get(s..s + self.taps)) {
-                // Inside the signal: a plain dot product.
-                Some(xs) => xs.iter().zip(w).fold(0.0f32, |a, (v, k)| a + v * k),
-                // At the edges, taps outside the signal are skipped, as `resample_channel` does.
-                None => (0..self.taps as i64)
-                    .filter(|k| (0..len).contains(&(start + k)))
-                    .fold(0.0f32, |a, k| a + x.get((start + k) as usize).copied().unwrap_or(0.0) * w.get(k as usize).copied().unwrap_or(0.0)),
-            };
-            out.push(acc);
-        }
-        out.resize(out_len, 0.0);
-        out
+        self.poly.process_from(x, self.start, out_len)
     }
 }
 
@@ -327,7 +323,7 @@ pub fn resample(ch: &[Vec<f32>], from: u32, to: u32) -> Vec<Vec<f32>> {
     let ratio = f64::from(to) / f64::from(from);
     let cutoff = if ratio < 1.0 { ratio * 0.94 } else { 0.97 };
     let table = SincTable::new(cutoff);
-    let bank = Polyphase::new(from, to, &table);
+    let bank = Bank::new(from, to, &table);
     ch.iter()
         .map(|c| {
             let out_len = ((c.len() as f64 * ratio).round() as usize).min(MAX_OFFLINE_SAMPLES);
@@ -841,6 +837,9 @@ pub fn peak_db(ch: &[Vec<f32>]) -> f32 {
 }
 
 #[cfg(test)]
+mod resample_vectors;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -856,7 +855,7 @@ mod tests {
             let cutoff = if ratio < 1.0 { ratio * 0.94 } else { 0.97 };
             let table = SincTable::new(cutoff);
             let reference = resample_channel(&x, ratio, out_len, &table);
-            let bank = Polyphase::new(from, to, &table).expect("small common ratio");
+            let bank = Bank::new(from, to, &table).expect("small common ratio");
             let fast = bank.run(&x, out_len);
             assert_eq!(fast.len(), reference.len(), "{from}->{to}");
             let worst = fast.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -867,10 +866,10 @@ mod tests {
         let short = [0.5f32, -0.25, 0.75];
         let table = SincTable::new(0.97);
         let reference = resample_channel(&short, 48_000.0 / 44_100.0, 3, &table);
-        let fast = Polyphase::new(44_100, 48_000, &table).expect("bank").run(&short, 3);
+        let fast = Bank::new(44_100, 48_000, &table).expect("bank").run(&short, 3);
         assert!(fast.iter().zip(&reference).all(|(a, b)| (a - b).abs() < 1e-6), "{fast:?} {reference:?}");
         // Rates with no small common ratio fall back to the per-tap kernel.
-        assert!(Polyphase::new(44_100, 96_001, &table).is_none());
+        assert!(Bank::new(44_100, 96_001, &table).is_none());
         assert_eq!(resample(&[short.to_vec()], 44_100, 96_001)[0].len(), 7);
     }
 
