@@ -1105,7 +1105,7 @@ dependencies = [
 [[package]]
 name = "craft-resample"
 version = "0.1.0"
-source = "git+https://github.com/cloudbring/craft-libs?rev=5f235e0707b7300dd17991ad0b38e2c137316f10#5f235e0707b7300dd17991ad0b38e2c137316f10"
+source = "git+https://github.com/cloudbring/craft-libs?rev=b0574cf739e3dcf86c9cc157db9d759071e41c34#b0574cf739e3dcf86c9cc157db9d759071e41c34"
 
 [[package]]
 name = "craft-ui"

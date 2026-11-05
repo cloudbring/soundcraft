@@ -52,8 +52,8 @@ cpal = "0.18"
 # Which file paths stored in a session may be opened.
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 
-# Proved polyphase rational resampler (Lean: polyphase = filter then decimate). 5f235e0 adds process_from (algo/224-resample-api).
-craft-resample = { version = "0.1.0", git = "https://github.com/cloudbring/craft-libs", rev = "5f235e0707b7300dd17991ad0b38e2c137316f10" }
+# Proved polyphase rational resampler (Lean: polyphase = filter then decimate). b0574cf adds process_from (algo/224-resample-api).
+craft-resample = { version = "0.1.0", git = "https://github.com/cloudbring/craft-libs", rev = "b0574cf739e3dcf86c9cc157db9d759071e41c34" }
 
 # Video containers and bitstreams, shared with the other craft apps.
 craft-media = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
