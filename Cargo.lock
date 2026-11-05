@@ -1062,6 +1062,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-compare"
+version = "0.1.0"
+source = "git+https://github.com/cloudbring/craft-libs?rev=3b868c05cd328ff1be366d1638169083976ca7e4#3b868c05cd328ff1be366d1638169083976ca7e4"
+
+[[package]]
 name = "craft-docpath"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=c5a1cbfb5f9049f9270955caffb5bee5997aebf7#c5a1cbfb5f9049f9270955caffb5bee5997aebf7"
@@ -4333,6 +4338,7 @@ dependencies = [
 name = "soundcraft-audio-io"
 version = "0.17.0"
 dependencies = [
+ "craft-compare",
  "log",
  "proptest",
  "serde",
@@ -4388,6 +4394,7 @@ dependencies = [
 name = "soundcraft-dsp"
 version = "0.17.0"
 dependencies = [
+ "craft-compare",
  "log",
  "proptest",
  "rustfft",
@@ -4399,6 +4406,7 @@ dependencies = [
 name = "soundcraft-engine"
 version = "0.17.0"
 dependencies = [
+ "craft-compare",
  "craft-docpath",
  "log",
  "proptest",

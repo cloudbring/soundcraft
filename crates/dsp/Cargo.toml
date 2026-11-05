@@ -13,6 +13,7 @@ log.workspace = true
 rustfft.workspace = true
 
 [dev-dependencies]
+craft-compare.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
 

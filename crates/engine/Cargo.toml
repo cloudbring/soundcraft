@@ -26,6 +26,7 @@ zip.workspace = true
 craft-docpath.workspace = true
 
 [dev-dependencies]
+craft-compare.workspace = true
 proptest.workspace = true
 
 [lints]

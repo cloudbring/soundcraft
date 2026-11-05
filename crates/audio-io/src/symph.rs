@@ -507,6 +507,7 @@ fn run(bytes: &[u8], detected: FileFormat, count_only: bool) -> Result<(AudioInf
         }
     }
     let params = audio_params(track).cloned().ok_or_else(|| AudioError::Malformed("track vanished".into()))?;
+    let is_mp4 = reader.format_info().short_name == "isomp4";
     let alac = params.extra_data.as_deref().filter(|_| params.codec == CODEC_ID_ALAC).and_then(|d| be_u32(d, 0));
     if params.max_frames_per_packet.into_iter().chain(alac.map(u64::from)).any(|n| n > MAX_PACKET_FRAMES) {
         return Err(AudioError::Malformed("the file declares packets far longer than any codec uses".into()));
@@ -576,8 +577,28 @@ fn run(bytes: &[u8], detected: FileFormat, count_only: bool) -> Result<(AudioInf
         planar = (0..usize::from(info.channels)).map(|_| Vec::new()).collect();
     }
     info.frames = if count_only { frames } else { planar.iter().map(Vec::len).min().unwrap_or(0) as u64 };
+    if is_mp4 {
+        let (skip, kept) = edit_trim(bytes, info.sample_rate, info.frames);
+        if !count_only {
+            for plane in &mut planar {
+                plane.truncate(usize::try_from(skip.saturating_add(kept)).unwrap_or(usize::MAX));
+                plane.drain(..usize::try_from(skip).unwrap_or(usize::MAX).min(plane.len()));
+            }
+        }
+        info.frames = kept;
+    }
     let sample_rate = info.sample_rate;
     Ok((info, AudioBuffer { sample_rate, channels: planar }))
+}
+
+/// How many leading frames of `decoded` frames an MP4 edit list drops, and how many remain after
+/// that. Without a usable edit list nothing is dropped. The kept count never exceeds what was decoded.
+fn edit_trim(bytes: &[u8], rate: u32, decoded: u64) -> (u64, u64) {
+    let Some(range) = crate::mp4::edit_range(bytes) else { return (0, decoded) };
+    let (skip, len) = range.frames_at(rate);
+    let skip = skip.min(decoded);
+    let avail = decoded - skip;
+    (skip, len.map_or(avail, |l| l.min(avail)))
 }
 
 /// Frames symphonia's AAC decoder yields for every packet; it supports no other frame length.
@@ -619,6 +640,7 @@ pub(crate) fn probe(bytes: &[u8], detected: FileFormat) -> Result<AudioInfo> {
         let (track_id, mut info) = info_of(reader.as_ref(), detected)?;
         if info.frames > 0 && info.channels > 0 && is_mp4_aac(reader.as_ref(), track_id) {
             info.frames = mp4_aac_frames(reader.as_mut(), track_id)?;
+            info.frames = edit_trim(bytes, info.sample_rate, info.frames).1;
         }
         if info.frames > 0 && info.channels > 0 {
             return Ok(info);

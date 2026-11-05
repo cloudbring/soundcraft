@@ -52,6 +52,10 @@ cpal = "0.18"
 # Which file paths stored in a session may be opened.
 craft-docpath = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 
+# Oracle metrics (audio SNR, BS.1770 integrated loudness) for the tests only. The rev is on the
+# cloudbring fork until the compare crate lands on storytold/craft-libs main.
+craft-compare = { version = "0.1.0", git = "https://github.com/cloudbring/craft-libs", rev = "3b868c05cd328ff1be366d1638169083976ca7e4" }
+
 # Video containers and bitstreams, shared with the other craft apps.
 craft-media = { version = "0.1.0", git = "https://github.com/storytold/craft-libs", rev = "c5a1cbfb5f9049f9270955caffb5bee5997aebf7" }
 # craft-update: app-specific pretend versions apply to startup and manual checks.

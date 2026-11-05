@@ -218,7 +218,7 @@ impl Bounce {
             EngineError::Io(format!("{}: {err}", path.display()))
         })?;
         let render = soundcraft_mix::RangeRender::new(&s, bus, r, 1024);
-        let meter = soundcraft_dsp::meter::LoudnessMeter::new(s.sample_rate.as_f64() as f32, channels);
+        let meter = loudness_meter(s.sample_rate.as_f64() as f32, fmt, channels);
         Ok(Bounce {
             session: s,
             path: path.to_path_buf(),
@@ -383,6 +383,22 @@ impl std::io::Seek for Out {
             Out::Memory(m) => m.seek(pos),
         }
     }
+}
+
+/// A BS.1770 loudness meter for `channels` channels laid out as `fmt`: the LFE is left out and every
+/// surround speaker (sides, rears, centre surround) counts 1.41. The meter alone only knows a
+/// channel count, which reads a 7.1 bounce 14 LU too loud when the LFE carries signal.
+fn loudness_meter(rate: f32, fmt: ChannelFormat, channels: usize) -> soundcraft_dsp::meter::LoudnessMeter {
+    use soundcraft_model::Speaker::{Cs, Lfe, Lrs, Ls, Lss, Rrs, Rs, Rss};
+    let mut meter = soundcraft_dsp::meter::LoudnessMeter::new(rate, channels);
+    for (i, sp) in fmt.speakers().iter().enumerate().take(channels) {
+        match sp {
+            Lfe => meter.set_channel_weight(i, 0.0),
+            Ls | Rs | Lss | Rss | Lrs | Rrs | Cs => meter.set_channel_weight(i, 1.41),
+            _ => {}
+        }
+    }
+    meter
 }
 
 const MAX_BOUNCE_SECS: f64 = 4.0 * 3600.0;
@@ -840,5 +856,41 @@ mod stem_tests {
         assert!(plain_error <= 0.5 + 1e-3, "{plain_error}");
         assert!(dithered_error > 0.6, "{dithered_error}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod loudness_layout_tests {
+    use super::*;
+
+    fn tone(db: f32, n: usize) -> Vec<f32> {
+        (0..n).map(|i| 10f32.powf(db / 20.0) * (std::f32::consts::TAU * 1000.0 * i as f32 / 48_000.0).sin()).collect()
+    }
+
+    /// Integrated loudness of 7.1 with a loud LFE: found by the ffmpeg loudness oracle
+    /// (`crates/dsp/tests/it/loudness_oracle.rs`). A meter that knows only a channel count read -8.8
+    /// LUFS where BS.1770 (and ffmpeg's ebur128, and craft-compare) say -23.0.
+    #[test]
+    fn seven_one_leaves_out_the_lfe_and_weights_the_surrounds() {
+        let n = 48_000 * 10;
+        let chans: Vec<Vec<f32>> = [-28.0, -28.0, -24.0, -6.0, -33.0, -33.0, -33.0, -33.0].iter().map(|&d| tone(d, n)).collect();
+        let mut m = loudness_meter(48_000.0, ChannelFormat::Surround71, 8);
+        m.process(&chans, n);
+        assert!((m.integrated_lufs() + 23.01).abs() < 0.05, "{}", m.integrated_lufs());
+        let mut plain = soundcraft_dsp::meter::LoudnessMeter::new(48_000.0, 8);
+        plain.process(&chans, n);
+        assert!(plain.integrated_lufs() > -10.0, "the count-only meter is the broken behaviour this guards against");
+    }
+
+    #[test]
+    fn stereo_and_five_one_weights_match_the_meter_defaults() {
+        let n = 48_000 * 5;
+        for (fmt, ch) in [(ChannelFormat::Stereo, 2), (ChannelFormat::Surround51, 6), (ChannelFormat::Surround50, 5)] {
+            let chans: Vec<Vec<f32>> = (0..ch).map(|c| tone(-30.0 + c as f32, n)).collect();
+            let (mut a, mut b) = (loudness_meter(48_000.0, fmt, ch), soundcraft_dsp::meter::LoudnessMeter::new(48_000.0, ch));
+            a.process(&chans, n);
+            b.process(&chans, n);
+            assert_eq!(a.integrated_lufs(), b.integrated_lufs(), "{fmt:?}");
+        }
     }
 }

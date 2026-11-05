@@ -190,12 +190,17 @@ fn k_weighting(sr: f32) -> [Coeffs; 2] {
 }
 
 impl LoudnessMeter {
-    /// Creates a meter. Channel weights default to 1.0, except a 6-channel (5.1: L R C LFE Ls Rs)
-    /// layout which uses 0 for LFE and 1.41 for the surrounds.
+    /// Creates a meter. Channel weights default to 1.0, except the 5-channel (5.0: L R C Ls Rs)
+    /// layout, which uses 1.41 for the surrounds, and the 6-channel (5.1: L R C LFE Ls Rs) layout,
+    /// which uses 0 for LFE and 1.41 for the surrounds. Other layouts need `set_channel_weight`.
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let sr = sane_sr(sample_rate);
         let channels = channels.clamp(1, crate::util::MAX_CHANNELS);
-        let weights = if channels == 6 { vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41] } else { vec![1.0; channels] };
+        let weights = match channels {
+            5 => vec![1.0, 1.0, 1.0, 1.41, 1.41],
+            6 => vec![1.0, 1.0, 1.0, 0.0, 1.41, 1.41],
+            _ => vec![1.0; channels],
+        };
         let [c1, c2] = k_weighting(sr);
         // Interpolation filter: windowed sinc at the original Nyquist, split into 4 phases.
         let mut tp_coefs = [[0.0f32; TP_PHASES]; TP_TAPS];

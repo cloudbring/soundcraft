@@ -10,6 +10,7 @@ mod fader_merge_full_history;
 mod hostile_params;
 mod hostile_sessions;
 mod long_renders;
+mod loudness_oracle;
 mod midi_offset;
 mod min_secs_with_timecode_counter;
 mod mix_required_params;
@@ -21,3 +22,6 @@ mod split_into_mono;
 mod time_key_signatures;
 mod track_name_collisions;
 mod trim_to_selection;
+
+#[path = "../../../audio-io/tests/support/oracle.rs"]
+mod oracle;

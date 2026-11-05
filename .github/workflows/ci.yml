@@ -24,4 +24,8 @@ jobs:
       packages: >-
         pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libxcursor-dev
         libxrandr-dev libxi-dev libfontconfig1-dev libfreetype-dev mesa-vulkan-drivers
-        libgl1-mesa-dev libasound2-dev
+        libgl1-mesa-dev libasound2-dev ffmpeg
+      # ffmpeg is the oracle for crates/{audio-io,dsp,engine} tests: without it they would skip, so
+      # CI makes a missing ffmpeg a failure (docs/verification/audio-oracles.md).
+      env: |
+        SOUNDCRAFT_REQUIRE_ORACLES=1
